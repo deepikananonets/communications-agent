@@ -777,10 +777,18 @@ def _pg_conn_via_ssh():
             conn.close()
         return
 
+    # Check if SSH key file exists and is readable
+    ssh_key_path = config.SSH_CONFIG['private_key_path']
+    if not os.path.isfile(ssh_key_path):
+        raise FileNotFoundError(f"SSH private key file not found: {ssh_key_path}")
+    
+    # Log SSH connection details (without sensitive info)
+    logger.info(f"Establishing SSH tunnel to {config.SSH_CONFIG['bastion_host']}:{config.SSH_CONFIG['bastion_port']} as {config.SSH_CONFIG['bastion_user']}")
+    
     server = SSHTunnelForwarder(
         (config.SSH_CONFIG['bastion_host'], config.SSH_CONFIG['bastion_port']),
         ssh_username=config.SSH_CONFIG['bastion_user'],
-        ssh_pkey=config.SSH_CONFIG['private_key_path'],
+        ssh_pkey=ssh_key_path,
         remote_bind_address=(config.DB_CONFIG['host'], config.DB_CONFIG['port']),
         set_keepalive=60.0,
     )
