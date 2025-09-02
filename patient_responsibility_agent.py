@@ -15,7 +15,7 @@ Author: Auto-generated
 import requests
 import json
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 import time
 import logging
@@ -754,7 +754,7 @@ class ZapierWebhook:
 
 def utc_now():
     # Return timezone-aware UTC for Postgres timestamptz
-    return datetime.now(datetime.timezone.utc)
+    return datetime.now(timezone.utc)
 
 @contextlib.contextmanager
 def _pg_conn_via_ssh():
