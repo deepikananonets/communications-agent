@@ -1155,8 +1155,6 @@ class PatientResponsibilityAgent:
         # Step 1: Authenticate with AdvancedMD
         if not self.amd_api.authenticate():
             logger.error("Failed to authenticate with AdvancedMD")
-            run_ended = utc_now()
-            log_agent_run_error("Failed to authenticate with AdvancedMD", self.run_started, run_ended)
             return
         
         # Step 2: Get updated patients from last 24h with insurance
@@ -1165,8 +1163,6 @@ class PatientResponsibilityAgent:
         
         if not patients:
             logger.warning("No patients found")
-            run_ended = utc_now()
-            log_agent_run_success("No patients to process", self.run_started, run_ended, 0)
             return
         
         # Step 3: Filter patients WITHOUT appointments
@@ -1226,23 +1222,39 @@ class PatientResponsibilityAgent:
                             logger.info(f"Successfully posted comprehensive memo for {patient['name']} - {insurance.get('carname')}")
                             logger.debug(f"Memo content:\n{memo_text}")
                             self.documents_processed += 1
+                            
+                            # Log success to database with patient name and memo content
+                            memo_success_time = utc_now()
+                            log_agent_run_success(
+                                f"Patient: {patient['name']} | Memo: {memo_text}",
+                                memo_success_time,
+                                memo_success_time,
+                                1
+                            )
                         else:
                             logger.error(f"Failed to post memo for {patient['name']} - {insurance.get('carname')}")
+                            
+                            # Log error to database
+                            memo_error_time = utc_now()
+                            log_agent_run_error(
+                                f"Failed to post memo for patient {patient['name']} - {insurance.get('carname')}",
+                                memo_error_time,
+                                memo_error_time
+                            )
                 
             except Exception as e:
                 logger.error(f"Error processing patient {patient['name']}: {e}")
+                
+                # Log processing error to database
+                process_error_time = utc_now()
+                log_agent_run_error(
+                    f"Error processing patient {patient['name']}: {str(e)}",
+                    process_error_time,
+                    process_error_time
+                )
                 continue
         
         logger.info("Patient responsibility processing completed")
-        
-        # Log successful completion
-        run_ended = utc_now()
-        log_agent_run_success(
-            f"Processed {len(self.final_patients)} patients",
-            self.run_started,
-            run_ended,
-            self.documents_processed
-        )
     
     def get_summary(self) -> Dict:
         """Get processing summary."""
@@ -1281,12 +1293,8 @@ def main():
     
     except KeyboardInterrupt:
         logger.info("Processing interrupted by user")
-        run_ended = utc_now()
-        log_agent_run_error("Processing interrupted by user", run_started, run_ended)
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        run_ended = utc_now()
-        log_agent_run_error(str(e), run_started, run_ended)
 
 
 if __name__ == "__main__":
