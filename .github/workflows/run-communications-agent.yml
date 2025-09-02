@@ -1,0 +1,65 @@
+name: Run Communications Agent Daily
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *" # every day at midnight Denver time
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      # Agent ID
+      AGENT_ID: ${{ secrets.AGENT_ID }}
+      
+      # Database Configuration
+      FLEMING_DB_HOST: ${{ secrets.FLEMING_DB_HOST }}
+      FLEMING_DB_NAME: ${{ secrets.FLEMING_DB_NAME }}
+      FLEMING_DB_USER: ${{ secrets.FLEMING_DB_USER }}
+      FLEMING_DB_PASSWORD: ${{ secrets.FLEMING_DB_PASSWORD }}
+      FLEMING_DB_PORT: ${{ secrets.FLEMING_DB_PORT }}
+      FLEMING_DB_SSLMODE: ${{ secrets.FLEMING_DB_SSLMODE }}
+      
+      # SSH Configuration
+      USE_SSH: ${{ secrets.USE_SSH }}
+      FLEMING_SSH_HOST: ${{ secrets.FLEMING_SSH_HOST }}
+      FLEMING_SSH_PORT: ${{ secrets.FLEMING_SSH_PORT }}
+      FLEMING_SSH_USER: ${{ secrets.FLEMING_SSH_USER }}
+      SSH_PRIVATE_KEY_PATH: /home/runner/.ssh/id_rsa
+
+      # AdvancedMD API Configuration
+      AMD_USERNAME: ${{ secrets.AMD_USERNAME }}
+      AMD_PASSWORD: ${{ secrets.AMD_PASSWORD }}
+      AMD_OFFICE_CODE: ${{ secrets.AMD_OFFICE_CODE }}
+
+      # Zapier Webhook Configuration
+      ZAPIER_WEBHOOK_URL: ${{ secrets.ZAPIER_WEBHOOK_URL }}
+
+      # PVerify API Configuration
+      PVERIFY_CLIENT_ID: ${{ secrets.PVERIFY_CLIENT_ID }}
+      PVERIFY_CLIENT_SECRET: ${{ secrets.PVERIFY_CLIENT_SECRET }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Prepare SSH key for bastion
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.BASTION_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p "${FLEMING_SSH_PORT}" "${FLEMING_SSH_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run patient responsibility agent
+        shell: bash
+        run: |
+          # Optional: keep .env for local dev; env from Actions already set
+          if [ -f .env ]; then set -a; source .env; set +a; fi
+          python patient_responsibility_agent.py

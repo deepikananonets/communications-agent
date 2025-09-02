@@ -19,7 +19,13 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import time
 import logging
-from config import AMD_CONFIG, ZAPIER_WEBHOOK_URL, PROCESSING_CONFIG, MEDICAID_INDICATORS, PVERIFY_CONFIG, STATE_IDS
+import os
+import uuid
+import contextlib
+import psycopg2
+import psycopg2.extras
+from sshtunnel import SSHTunnelForwarder
+import config
 
 # Configure logging
 logging.basicConfig(
@@ -36,12 +42,12 @@ class AdvancedMDAPI:
     """AdvancedMD API client for patient and insurance management."""
     
     def __init__(self):
-        self.base_url = AMD_CONFIG['base_url']
-        self.api_base_url = AMD_CONFIG['api_base_url']
-        self.username = AMD_CONFIG['username']
-        self.password = AMD_CONFIG['password']
-        self.office_code = AMD_CONFIG['office_code']
-        self.app_name = AMD_CONFIG['app_name']
+        self.base_url = config.AMD_CONFIG['base_url']
+        self.api_base_url = config.AMD_CONFIG['api_base_url']
+        self.username = config.AMD_CONFIG['username']
+        self.password = config.AMD_CONFIG['password']
+        self.office_code = config.AMD_CONFIG['office_code']
+        self.app_name = config.AMD_CONFIG['app_name']
         self.token = None
         
     def authenticate(self) -> bool:
@@ -378,13 +384,13 @@ class PVerifyAPI:
     """PVerify API client for insurance eligibility verification."""
     
     def __init__(self):
-        self.token_url = PVERIFY_CONFIG['token_url']
-        self.discovery_url = PVERIFY_CONFIG['discovery_url']
-        self.eligibility_url = PVERIFY_CONFIG['eligibility_url']
-        self.client_id = PVERIFY_CONFIG['client_id']
-        self.client_secret = PVERIFY_CONFIG['client_secret']
-        self.provider_last_name = PVERIFY_CONFIG['provider_last_name']
-        self.provider_npi = PVERIFY_CONFIG['provider_npi']
+        self.token_url = config.PVERIFY_CONFIG['token_url']
+        self.discovery_url = config.PVERIFY_CONFIG['discovery_url']
+        self.eligibility_url = config.PVERIFY_CONFIG['eligibility_url']
+        self.client_id = config.PVERIFY_CONFIG['client_id']
+        self.client_secret = config.PVERIFY_CONFIG['client_secret']
+        self.provider_last_name = config.PVERIFY_CONFIG['provider_last_name']
+        self.provider_npi = config.PVERIFY_CONFIG['provider_npi']
         self.access_token = None
         self.token_expires_at = None
     
@@ -472,13 +478,13 @@ class PVerifyAPI:
         state = patient.get('state', '').upper().strip()
         
         if state in ['CO', 'COLORADO']:
-            return 'CO', STATE_IDS['CO']
+            return 'CO', config.STATE_IDS['CO']
         elif state in ['TX', 'TEXAS']:
-            return 'TX', STATE_IDS['TX']
+            return 'TX', config.STATE_IDS['TX']
         else:
             # Default to CO if state is unclear
             logger.warning(f"Unknown state '{state}' for patient {patient.get('name')}, defaulting to CO")
-            return 'CO', STATE_IDS['CO']
+            return 'CO', config.STATE_IDS['CO']
     
     def insurance_discovery(self, patient: Dict) -> Optional[Dict]:
         """Perform insurance discovery for a patient."""
@@ -746,6 +752,131 @@ class ZapierWebhook:
             return None
 
 
+def utc_now():
+    # Return timezone-aware UTC for Postgres timestamptz
+    return datetime.now(datetime.timezone.utc)
+
+@contextlib.contextmanager
+def _pg_conn_via_ssh():
+    """
+    Yields a psycopg2 connection to RDS through an SSH tunnel (or direct if USE_SSH=0).
+    SSL is enforced (sslmode=require).
+    """
+    if not config.SSH_CONFIG['use_ssh']:
+        conn = psycopg2.connect(
+            host=config.DB_CONFIG['host'],
+            port=config.DB_CONFIG['port'],
+            dbname=config.DB_CONFIG['database'],
+            user=config.DB_CONFIG['username'],
+            password=config.DB_CONFIG['password'],
+            sslmode=config.DB_CONFIG['sslmode'],
+        )
+        try:
+            yield conn
+        finally:
+            conn.close()
+        return
+
+    server = SSHTunnelForwarder(
+        (config.SSH_CONFIG['bastion_host'], config.SSH_CONFIG['bastion_port']),
+        ssh_username=config.SSH_CONFIG['bastion_user'],
+        ssh_pkey=config.SSH_CONFIG['private_key_path'],
+        remote_bind_address=(config.DB_CONFIG['host'], config.DB_CONFIG['port']),
+        set_keepalive=60.0,
+    )
+    server.start()
+    try:
+        conn = psycopg2.connect(
+            host="127.0.0.1",
+            port=server.local_bind_port,
+            dbname=config.DB_CONFIG['database'],
+            user=config.DB_CONFIG['username'],
+            password=config.DB_CONFIG['password'],
+            sslmode=config.DB_CONFIG['sslmode'],
+        )
+        try:
+            yield conn
+        finally:
+            conn.close()
+    finally:
+        server.stop()
+
+def log_agent_run_success(selected_plan_name: str, started_at_utc: datetime, ended_at_utc: datetime, documents_processed: int = 1):
+    """
+    Inserts a success row into agent_run_logs with explicit casts to match DB types.
+    """
+    if not selected_plan_name:
+        selected_plan_name = ""
+
+    output_payload = {
+        "message": "Patient responsibility processing completed successfully",
+        "selected_plan": selected_plan_name,
+        "documents_processed": documents_processed
+    }
+
+    sql = """
+        INSERT INTO agent_run_logs 
+          (agent_id, service_request_id, documents_processed, status,
+           output_data, start_time, end_time, call_id, vapi_listen_url,
+           vapi_control_url, manual_trigger)
+        VALUES
+          (%s::uuid, NULL::int, %s::int, %s, %s::jsonb, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
+    """
+    args = (
+        str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),  # ensure UUID type
+        int(documents_processed),                 # int
+        "success",                                # text
+        psycopg2.extras.Json(output_payload),     # json -> jsonb
+        started_at_utc,                           # timestamptz
+        ended_at_utc,                             # timestamptz
+        False,                                    # bool
+    )
+
+    try:
+        with _pg_conn_via_ssh() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, args)
+            conn.commit()
+        logger.info("agent_run_logs: success row inserted")
+    except Exception as e:
+        logger.error(f"Failed to write agent_run_logs: {e}", exc_info=True)
+
+def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_utc: datetime):
+    """
+    Inserts an error row into agent_run_logs.
+    """
+    output_payload = {
+        "message": "Patient responsibility processing failed",
+        "error": error_message
+    }
+
+    sql = """
+        INSERT INTO agent_run_logs 
+          (agent_id, service_request_id, documents_processed, status,
+           output_data, start_time, end_time, call_id, vapi_listen_url,
+           vapi_control_url, manual_trigger)
+        VALUES
+          (%s::uuid, NULL::int, %s::int, %s, %s::jsonb, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
+    """
+    args = (
+        str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),  # ensure UUID type
+        0,                                        # int - no documents processed on error
+        "error",                                  # text
+        psycopg2.extras.Json(output_payload),     # json -> jsonb
+        started_at_utc,                           # timestamptz
+        ended_at_utc,                             # timestamptz
+        False,                                    # bool
+    )
+
+    try:
+        with _pg_conn_via_ssh() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, args)
+            conn.commit()
+        logger.info("agent_run_logs: error row inserted")
+    except Exception as e:
+        logger.error(f"Failed to write agent_run_logs error: {e}", exc_info=True)
+
 class PatientResponsibilityAgent:
     """Main agent class that orchestrates the entire workflow."""
     
@@ -754,13 +885,15 @@ class PatientResponsibilityAgent:
         self.pverify_api = PVerifyAPI()
         self.zapier = ZapierWebhook(zapier_webhook_url)
         self.final_patients = []
+        self.run_started = None
+        self.documents_processed = 0
     
     def is_medicaid_insurance(self, insurance: Dict) -> bool:
         """Check if insurance is Medicaid based on carcode or carname."""
         carcode = insurance.get('carcode', '').upper()
         carname = insurance.get('carname', '').upper()
         
-        return any(indicator in carcode or indicator in carname for indicator in MEDICAID_INDICATORS)
+        return any(indicator in carcode or indicator in carname for indicator in config.MEDICAID_INDICATORS)
     
     def is_medicare_advantage(self, carname: str) -> bool:
         """Determine if insurance is Medicare Advantage based on comprehensive rules."""
@@ -853,7 +986,7 @@ class PatientResponsibilityAgent:
         carname = insurance.get('carname', '').upper()
         
         # Check if Medicaid
-        if any(indicator in carcode or indicator in carname for indicator in MEDICAID_INDICATORS):
+        if any(indicator in carcode or indicator in carname for indicator in config.MEDICAID_INDICATORS):
             return 'Medicaid'
         
         # Check if Self-Pay (typically no insurance or specific codes)
@@ -1016,6 +1149,7 @@ class PatientResponsibilityAgent:
     
     def process_patients(self):
         """Main processing workflow."""
+        self.run_started = utc_now()
         logger.info("Starting patient responsibility processing...")
         
         # Step 1: Authenticate with AdvancedMD
@@ -1025,7 +1159,7 @@ class PatientResponsibilityAgent:
         
         # Step 2: Get updated patients from last 24h with insurance
         logger.info("Fetching updated patients...")
-        patients = self.amd_api.get_updated_patients(PROCESSING_CONFIG['hours_back'])
+        patients = self.amd_api.get_updated_patients(config.PROCESSING_CONFIG['hours_back'])
         
         if not patients:
             logger.warning("No patients found")
@@ -1087,11 +1221,37 @@ class PatientResponsibilityAgent:
                         if success:
                             logger.info(f"Successfully posted comprehensive memo for {patient['name']} - {insurance.get('carname')}")
                             logger.debug(f"Memo content:\n{memo_text}")
+                            self.documents_processed += 1
+                            
+                            # Log success to database with patient name and memo content
+                            memo_success_time = utc_now()
+                            log_agent_run_success(
+                                f"Patient: {patient['name']} | Memo: {memo_text}",
+                                memo_success_time,
+                                memo_success_time,
+                                1
+                            )
                         else:
                             logger.error(f"Failed to post memo for {patient['name']} - {insurance.get('carname')}")
+                            
+                            # Log error to database
+                            memo_error_time = utc_now()
+                            log_agent_run_error(
+                                f"Failed to post memo for patient {patient['name']} - {insurance.get('carname')}",
+                                memo_error_time,
+                                memo_error_time
+                            )
                 
             except Exception as e:
                 logger.error(f"Error processing patient {patient['name']}: {e}")
+                
+                # Log processing error to database
+                process_error_time = utc_now()
+                log_agent_run_error(
+                    f"Error processing patient {patient['name']}: {str(e)}",
+                    process_error_time,
+                    process_error_time
+                )
                 continue
         
         logger.info("Patient responsibility processing completed")
@@ -1115,7 +1275,8 @@ class PatientResponsibilityAgent:
 def main():
     """Main execution function."""
     # Initialize and run agent
-    agent = PatientResponsibilityAgent(ZAPIER_WEBHOOK_URL)
+    agent = PatientResponsibilityAgent(config.ZAPIER_WEBHOOK_URL)
+    run_started = utc_now()
     
     try:
         agent.process_patients()
