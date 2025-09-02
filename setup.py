@@ -32,15 +32,12 @@ def setup_configuration():
     """Guide user through configuration setup."""
     print("\n=== Configuration Setup ===")
     
-    config_file = "config.py"
-    if not os.path.exists(config_file):
-        print(f"❌ Configuration file {config_file} not found")
-        return False
-    
-    print("Please update the following in config.py:")
-    print("1. ZAPIER_WEBHOOK_URL - Replace XXXXXXX with your actual Zapier hook IDs")
-    print("2. AMD_CONFIG credentials if different from defaults")
-    print("3. PROCESSING_CONFIG parameters if needed")
+    print("Configuration is now handled via environment variables.")
+    print("Please set the following environment variables (or GitHub Secrets):")
+    print("1. ZAPIER_WEBHOOK_URL - Your Zapier webhook URL")
+    print("2. AMD_BASE_URL, AMD_USERNAME, AMD_PASSWORD, etc. - AMD API credentials")
+    print("3. FLEMING_DB_HOST, FLEMING_DB_NAME, etc. - Database configuration")
+    print("4. All other required environment variables as listed in the documentation")
     
     return True
 
@@ -75,7 +72,7 @@ def main():
     
     print("\n✅ Setup completed successfully!")
     print("\nNext steps:")
-    print("1. Update config.py with your Zapier webhook URL")
+    print("1. Set all required environment variables (or use GitHub Secrets)")
     print("2. Run: python test_connections.py")
     print("3. Run: python patient_responsibility_agent.py")
     

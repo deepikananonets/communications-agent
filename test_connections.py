@@ -68,7 +68,7 @@ def test_configuration():
     print("\nTesting Configuration...")
     
     required_amd_keys = ['base_url', 'api_base_url', 'username', 'password', 'office_code', 'app_name']
-    missing_keys = [key for key in required_amd_keys if key not in AMD_CONFIG]
+    missing_keys = [key for key in required_amd_keys if not AMD_CONFIG.get(key)]
     
     if missing_keys:
         print(f"❌ Missing AMD configuration keys: {missing_keys}")
