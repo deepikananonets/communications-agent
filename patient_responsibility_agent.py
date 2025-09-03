@@ -809,18 +809,14 @@ def _pg_conn_via_ssh():
     finally:
         server.stop()
 
-def log_agent_run_success(selected_plan_name: str, started_at_utc: datetime, ended_at_utc: datetime, documents_processed: int = 1):
+def log_agent_run_success(patient_memo: str, started_at_utc: datetime, ended_at_utc: datetime, documents_processed: int = 1):
     """
     Inserts a success row into agent_run_logs with explicit casts to match DB types.
     """
-    if not selected_plan_name:
-        selected_plan_name = ""
+    if not patient_memo:
+        patient_memo = ""
 
-    output_payload = {
-        "message": "Patient responsibility processing completed successfully",
-        "selected_plan": selected_plan_name,
-        "documents_processed": documents_processed
-    }
+    output_payload = patient_memo
 
     sql = """
         INSERT INTO agent_run_logs 
@@ -834,7 +830,7 @@ def log_agent_run_success(selected_plan_name: str, started_at_utc: datetime, end
         str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),  # ensure UUID type
         int(documents_processed),                 # int
         "success",                                # text
-        psycopg2.extras.Json(output_payload),     # json -> jsonb
+        output_payload,
         started_at_utc,                           # timestamptz
         ended_at_utc,                             # timestamptz
         False,                                    # bool
@@ -853,10 +849,7 @@ def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_u
     """
     Inserts an error row into agent_run_logs.
     """
-    output_payload = {
-        "message": "Patient responsibility processing failed",
-        "error": error_message
-    }
+    output_payload = error_message
 
     sql = """
         INSERT INTO agent_run_logs 
@@ -870,7 +863,7 @@ def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_u
         str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),  # ensure UUID type
         0,                                        # int - no documents processed on error
         "error",                                  # text
-        psycopg2.extras.Json(output_payload),     # json -> jsonb
+        output_payload,
         started_at_utc,                           # timestamptz
         ended_at_utc,                             # timestamptz
         False,                                    # bool
