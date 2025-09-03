@@ -824,7 +824,7 @@ def log_agent_run_success(patient_memo: str, started_at_utc: datetime, ended_at_
            output_data, start_time, end_time, call_id, vapi_listen_url,
            vapi_control_url, manual_trigger)
         VALUES
-          (%s::uuid, NULL::int, %s::int, %s, %s::jsonb, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
+          (%s::uuid, NULL::int, %s::int, %s, %s, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
     """
     args = (
         str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),  # ensure UUID type
@@ -857,7 +857,7 @@ def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_u
            output_data, start_time, end_time, call_id, vapi_listen_url,
            vapi_control_url, manual_trigger)
         VALUES
-          (%s::uuid, NULL::int, %s::int, %s, %s::jsonb, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
+          (%s::uuid, NULL::int, %s::int, %s, %s, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
     """
     args = (
         str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),  # ensure UUID type
