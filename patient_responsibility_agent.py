@@ -849,7 +849,7 @@ def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_u
     """
     Inserts an error row into agent_run_logs.
     """
-    output_payload = psycopg2.extras.Json({"error": error_message})
+    output_payload = psycopg2.extras.Json({"message": error_message})
 
     sql = """
         INSERT INTO agent_run_logs 
