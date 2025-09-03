@@ -816,7 +816,7 @@ def log_agent_run_success(patient_memo: str, started_at_utc: datetime, ended_at_
     if not patient_memo:
         patient_memo = ""
 
-    output_payload = patient_memo
+    output_payload = psycopg2.extras.Json({"message": patient_memo})
 
     sql = """
         INSERT INTO agent_run_logs 
@@ -849,7 +849,7 @@ def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_u
     """
     Inserts an error row into agent_run_logs.
     """
-    output_payload = error_message
+    output_payload = psycopg2.extras.Json({"error": error_message})
 
     sql = """
         INSERT INTO agent_run_logs 
