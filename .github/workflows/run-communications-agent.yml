@@ -2,8 +2,8 @@ name: Run Communications Agent Daily
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * *" # every day at midnight Denver time
+  # schedule:
+  #   - cron: "0 6 * * *" # every day at midnight Denver time
 
 jobs:
   run:
@@ -57,26 +57,5 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Test database logging
-        shell: bash
-        run: |
-          # Test database connection and logging only
-          python3 -c "
-          import patient_responsibility_agent as pra
-          import config
-          
-          print('Testing database logging...')
-          try:
-              # Test database logging with sample data
-              test_time = pra.utc_now()
-              pra.log_agent_run_success(
-                  'Test run from GitHub Actions - Database logging working!',
-                  test_time,
-                  test_time,
-                  1
-              )
-              print('✓ Database logging test completed successfully!')
-          except Exception as e:
-              print(f'✗ Database logging test failed: {e}')
-              raise e
-          "
+      - name: Run Communications Agent
+        run: python patient_responsibility_agent.py
