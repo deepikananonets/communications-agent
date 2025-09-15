@@ -2,8 +2,8 @@ name: Run Communications Agent Daily
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: "0 6 * * *" # every day at midnight Denver time
+  schedule:
+    - cron: "0 6 * * *" # every day at midnight Denver time
 
 jobs:
   run:
@@ -11,7 +11,7 @@ jobs:
     env:
       # Agent ID
       AGENT_ID: ${{ secrets.AGENT_ID }}
-      
+
       # Database Configuration
       FLEMING_DB_HOST: ${{ secrets.FLEMING_DB_HOST }}
       FLEMING_DB_NAME: ${{ secrets.FLEMING_DB_NAME }}
@@ -19,7 +19,7 @@ jobs:
       FLEMING_DB_PASSWORD: ${{ secrets.FLEMING_DB_PASSWORD }}
       FLEMING_DB_PORT: ${{ secrets.FLEMING_DB_PORT }}
       FLEMING_DB_SSLMODE: ${{ secrets.FLEMING_DB_SSLMODE }}
-      
+
       # SSH Configuration
       USE_SSH: ${{ secrets.USE_SSH }}
       FLEMING_SSH_HOST: ${{ secrets.FLEMING_SSH_HOST }}
