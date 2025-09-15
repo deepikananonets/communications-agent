@@ -641,7 +641,10 @@ class PVerifyAPI:
         financial_data = {
             'copay': 0.0,
             'coinsurance': 0.0,
-            'deductible': 0.0
+            'deductible': 0.0,
+            'deductible_remaining': 0.0,
+            'annual_deductible': 0.0,
+            'deductible_met': 0.0
         }
         
         try:
@@ -700,10 +703,31 @@ class PVerifyAPI:
                                 elif 'deductible' in key and value and '$' in value:
                                     try:
                                         deduct_val = float(value.replace('$', '').replace(',', ''))
-                                        if deduct_val > financial_data['deductible']:
-                                            financial_data['deductible'] = deduct_val
+                                        if 'remaining' in key or 'left' in key or 'balance' in key:
+                                            if deduct_val > financial_data['deductible_remaining']:
+                                                financial_data['deductible_remaining'] = deduct_val
+                                        elif 'met' in key or 'satisfied' in key:
+                                            if deduct_val > financial_data['deductible_met']:
+                                                financial_data['deductible_met'] = deduct_val
+                                        elif 'annual' in key or 'yearly' in key:
+                                            if deduct_val > financial_data['annual_deductible']:
+                                                financial_data['annual_deductible'] = deduct_val
+                                        else:
+                                            # Generic deductible - could be annual or remaining
+                                            if deduct_val > financial_data['deductible']:
+                                                financial_data['deductible'] = deduct_val
                                     except ValueError:
                                         pass
+            
+            # Calculate deductible_remaining if we have annual and met amounts
+            if financial_data['annual_deductible'] > 0 and financial_data['deductible_met'] >= 0:
+                calculated_remaining = financial_data['annual_deductible'] - financial_data['deductible_met']
+                if financial_data['deductible_remaining'] == 0 or calculated_remaining > 0:
+                    financial_data['deductible_remaining'] = max(0, calculated_remaining)
+            
+            # If we only have a generic deductible value, assume it's remaining
+            elif financial_data['deductible'] > 0 and financial_data['deductible_remaining'] == 0:
+                financial_data['deductible_remaining'] = financial_data['deductible']
             
             logger.debug(f"Extracted financial data: {financial_data}")
             return financial_data
@@ -888,7 +912,117 @@ class PatientResponsibilityAgent:
         self.final_patients = []
         self.run_started = None
         self.documents_processed = 0
+        
+        # Initialize data structures for enhanced calculations
+        self._init_service_line_mappings()
+        self._init_payer_mappings()
+        self._init_allowed_amounts()
     
+    def _init_service_line_mappings(self):
+        """Initialize service line to CPT code mappings."""
+        self.service_line_cpt_mapping = {
+            'KAP': ['90791', '90837', '96130', '96130-59'],
+            'Spravato': ['G2082', 'G2083', 'S0013-84'],
+            'Med Management (Psych E/M)': ['99204', '99204-25', '99205-25', '99205-95', '99214', '99215', '99215-25', '99417', 'G2212'],
+            'IM ketamine': ['96372', '96372-59', 'J3490', 'J3490-GA']
+        }
+    
+    def _init_payer_mappings(self):
+        """Initialize insurance name to payer code mappings."""
+        self.payer_mappings = {
+            # Health First Medicaid
+            'HFM': ['HEALTH FIRST MEDICAID', 'HFM', 'MEDICAID'],
+            # Texas Blue Shield  
+            'TBS': ['TEXAS BLUE SHIELD', 'TBS', 'BLUE CROSS BLUE SHIELD OF TEXAS', 'BCBS TEXAS'],
+            # Anthem BCBS
+            'ANT': ['ANTHEM', 'ANTHEM BLUE CROSS', 'ANTHEM BCBS', 'ANTHEM BLUE CROSS BLUE SHIELD'],
+            # Colorado Access
+            'COA': ['COLORADO ACCESS', 'COA'],
+            # United Healthcare
+            'UHC': ['UNITED HEALTHCARE', 'UHC', 'UNITED', 'UNITEDHEALTHCARE'],
+            # Medicare
+            'MCR': ['MEDICARE', 'MCR', 'MEDICARE ADVANTAGE']
+        }
+    
+    def _init_allowed_amounts(self):
+        """Initialize allowed amounts lookup table."""
+        self.allowed_amounts = {
+            'HFM': {
+                '99215': 150.45, 'G2083': 1258.52, '99417-4': 176.42, '99417-2': 87.16,
+                '90837': 137.67, '99417-3': 131.17, '96372-59': 29.72, '99215-25': 158.99,
+                '99214': 108.00, 'J3490': 3.48, 'G2212': 94.08, '99417-5': 221.25,
+                '99417': 63.98, 'J3490-GA': 4.22, '96130': 101.74, '99205-25': 186.21,
+                'G2082': 857.80, '99204-25': 137.32, '90791': 160.21, '99417-6': 265.33,
+                '96372': 16.65, '99205-95': 188.38, '99204': 134.08, '96130-59': 34.59
+            },
+            'TBS': {
+                '99215': 132.07, 'G2083': 1005.74, '99417-4': 113.02, '99417-2': 59.35,
+                '90837': 105.12, '99417-3': 87.10, '96372-59': 27.94, '99215-25': 123.91,
+                '99214': 116.90, 'J3490': 9.95, 'G2212': 69.07, '99417-5': 138.14,
+                '99417': 54.88, 'J3490-GA': 5.67, '96130': 134.18, '99205-25': 220.84,
+                '99204-25': 180.38, '90791': 132.92, '99417-6': 206.10, '96372': 24.70,
+                'S0013-84': 1417.14, '99204': 124.34, '96130-59': 106.68
+            },
+            'ANT': {
+                '99215': 180.23, 'G2083': 1243.50, '99417-4': 130.95, '99417-2': 68.18,
+                '90837': 90.66, '99417-3': 98.83, '96372-59': 29.55, '99215-25': 177.63,
+                '99214': 133.80, 'J3490': 8.22, 'G2212': 426.67, '99417-5': 191.29,
+                '99417': 62.64, 'J3490-GA': 7.27, '96130': 129.49, '99205-25': 250.94,
+                'G2082': 892.97, '99204-25': 164.06, '90791': 95.01, '99417-6': 246.64,
+                '96372': 21.13, '99205-95': 260.29, '99204': 177.44, '96130-59': 128.82
+            },
+            'COA': {
+                '99215': 149.29, 'G2083': 1246.12, '99417-4': 174.28, '99417-2': 87.14,
+                '90837': 131.30, '99417-3': 130.71, '96372-59': 22.34, '99214': 108.68,
+                '99417': 55.71, '96130': 134.81, '99205-25': 186.02, '99204-25': 136.94,
+                '90791': 161.37, '96372': 14.78, '99205-95': 188.01, '99204': 136.94,
+                '96130-59': 150.00
+            },
+            'UHC': {
+                '99215': 197.63, '99417-4': 252.10, '99417-2': 59.52, '90837': 138.46,
+                '99417-3': 62.25, '96372-59': 34.60, '99215-25': 188.13, '99214': 104.41,
+                'J3490': 5.77, 'G2212': 173.99, '99417-5': 400.00, '99417': 53.13,
+                'J3490-GA': 10.26, '96130': 135.75, '99205-25': 200.80, '99204-25': 142.27,
+                '90791': 161.20, '99417-6': 360.00, '96372': 19.53, '99204': 125.32,
+                '96130-59': 109.55
+            },
+            'MCR': {
+                '99215': 179.34, '90837': 156.60, '99214': 127.92, 'J3490': 0.20,
+                'G2212': 31.52, '96130': 118.96, '90791': 169.43, '96372': 14.33
+            }
+        }
+
+    def get_payer_code(self, insurance_name: str) -> Optional[str]:
+        """Map insurance name to payer code for allowed amounts lookup."""
+        insurance_upper = insurance_name.upper().strip()
+        
+        # Check each payer mapping
+        for payer_code, name_variants in self.payer_mappings.items():
+            for variant in name_variants:
+                if variant in insurance_upper:
+                    return payer_code
+        
+        # Check for common patterns not in explicit mappings
+        if any(term in insurance_upper for term in ['BLUE CROSS', 'BCBS', 'BLUE SHIELD']):
+            if 'TEXAS' in insurance_upper:
+                return 'TBS'
+            elif 'ANTHEM' in insurance_upper:
+                return 'ANT'
+            else:
+                return 'TBS'  # Default to TBS for other BCBS variants
+        
+        # Return None if no match found - will use average calculation
+        return None
+    
+    def get_average_allowed_amount(self, cpt_code: str) -> float:
+        """Calculate average allowed amount across all payers for a CPT code."""
+        amounts = []
+        for payer_code, payer_amounts in self.allowed_amounts.items():
+            if cpt_code in payer_amounts:
+                amounts.append(payer_amounts[cpt_code])
+        
+        return sum(amounts) / len(amounts) if amounts else 0.0
+
     def is_medicaid_insurance(self, insurance: Dict) -> bool:
         """Check if insurance is Medicaid based on carcode or carname."""
         carcode = insurance.get('carcode', '').upper()
@@ -1001,59 +1135,140 @@ class PatientResponsibilityAgent:
         # Default to Commercial
         return 'Commercial'
     
-    def calculate_service_line_responsibility(self, insurance: Dict, pverify_data: Dict, service_line: str) -> str:
-        """Calculate patient responsibility for a specific service line."""
+    def calculate_service_line_responsibility_enhanced(self, insurance: Dict, pverify_data: Dict, service_line: str) -> float:
+        """Calculate patient responsibility using deductible and coinsurance with allowed amounts."""
         payer_type = self.get_payer_type(insurance)
+        
+        # Medicaid overrides - return 0 for specific service lines
+        if payer_type == 'Medicaid':
+            if service_line in ['IM ketamine', 'KAP']:
+                return 0.0
+            # For Spravato and Med Management, continue with calculation
+        
+        # Self-Pay overrides - return fixed amounts
+        if payer_type == 'Self-Pay':
+            if service_line == 'IM ketamine':
+                return 399.0
+            elif service_line == 'Spravato':
+                return 949.0
+            # For KAP and Med Management, continue with calculation (no explicit amounts)
+        
+        # Get financial data
         pverify_financial = pverify_data.get('financial_data', {})
         
-        # Get copay and coinsurance data (PVerify priority, AMD fallback)
+        # Get copay, coinsurance, and deductible data (PVerify priority, AMD fallback)
         copay_amount = pverify_financial.get('copay', 0) or insurance.get('copaydollaramount', 0)
         coinsurance_pct = pverify_financial.get('coinsurance', 0) or insurance.get('copaypercentageamount', 0)
+        deductible_remaining = pverify_financial.get('deductible_remaining', 0)
+        annual_deductible = pverify_financial.get('annual_deductible', 0) or insurance.get('annualdeductible', 0)
+        deductible_met = pverify_financial.get('deductible_met', 0) or insurance.get('deductibleamountmet', 0)
         
-        # Apply rules based on payer type and service line
-        if payer_type == 'Medicaid':
-            if service_line == 'IM ketamine':
-                return '$0 patient responsibility'
-            elif service_line == 'KAP':
-                return '$0 patient responsibility'
-            elif service_line == 'Spravato':
-                return 'Copay/coinsurance/deductible per eligibility'
-            elif service_line == 'Med Management (Psych E/M)':
-                return 'Typically $0 if eligible (Medicaid balances should be $0). Verify under the medical service type (drill to 01 = Medical Care) when checking E/M.'
+        # Calculate remaining deductible if not available from PVerify
+        if deductible_remaining == 0 and annual_deductible > 0:
+            deductible_remaining = max(0, annual_deductible - deductible_met)
         
-        elif payer_type == 'Commercial' or payer_type == 'Medicare Advantage':
-            # For commercial payers, return copay/coinsurance/deductible info
-            if copay_amount > 0:
-                return f'${copay_amount:.2f} copay'
-            elif coinsurance_pct > 0:
-                return f'{coinsurance_pct:.0f}% coinsurance'
+        # If we have a copay, use it (traditional copay plan)
+        if copay_amount > 0:
+            return copay_amount
+        
+        # Get CPT codes for this service line
+        cpt_codes = self.service_line_cpt_mapping.get(service_line, [])
+        if not cpt_codes:
+            return 0.0
+        
+        # Get payer code for allowed amounts lookup
+        insurance_name = insurance.get('carname', '')
+        payer_code = self.get_payer_code(insurance_name)
+        
+        # Calculate total allowed amount for all CPT codes in this service line
+        total_allowed = 0.0
+        for cpt_code in cpt_codes:
+            if payer_code and cpt_code in self.allowed_amounts.get(payer_code, {}):
+                allowed_amount = self.allowed_amounts[payer_code][cpt_code]
             else:
-                return 'Copay/coinsurance/deductible per eligibility'
+                # Use average if payer not found or CPT not available for payer
+                allowed_amount = self.get_average_allowed_amount(cpt_code)
+            total_allowed += allowed_amount
         
+        if total_allowed == 0:
+            return 0.0
+        
+        # Calculate patient responsibility
+        patient_responsibility = 0.0
+        
+        # Apply deductible first
+        if deductible_remaining > 0:
+            deductible_portion = min(total_allowed, deductible_remaining)
+            patient_responsibility += deductible_portion
+            remaining_after_deductible = total_allowed - deductible_portion
+        else:
+            remaining_after_deductible = total_allowed
+        
+        # Apply coinsurance to remaining amount
+        if coinsurance_pct > 0 and remaining_after_deductible > 0:
+            coinsurance_portion = remaining_after_deductible * (coinsurance_pct / 100.0)
+            patient_responsibility += coinsurance_portion
+        
+        return round(patient_responsibility, 2)
+    
+    def calculate_service_line_responsibility(self, insurance: Dict, pverify_data: Dict, service_line: str) -> str:
+        """Calculate patient responsibility for a specific service line."""
+        # Use enhanced calculation to get dollar amount
+        enhanced_amount = self.calculate_service_line_responsibility_enhanced(insurance, pverify_data, service_line)
+        
+        payer_type = self.get_payer_type(insurance)
+        
+        # Handle special Medicaid cases that return text instead of dollar amounts
+        if payer_type == 'Medicaid':
+            if service_line == 'Med Management (Psych E/M)':
+                if enhanced_amount == 0.0:
+                    return 'Typically $0 if eligible (Medicaid balances should be $0). Verify under the medical service type (drill to 01 = Medical Care) when checking E/M.'
+                else:
+                    return f'${enhanced_amount:.2f} patient responsibility'
+            elif service_line == 'Spravato':
+                if enhanced_amount == 0.0:
+                    return 'Copay/coinsurance/deductible per eligibility'
+                else:
+                    return f'${enhanced_amount:.2f} patient responsibility'
+        
+        # Handle Self-Pay special text cases
         elif payer_type == 'Self-Pay':
             if service_line == 'IM ketamine':
                 return '$399 at first visit ("Self-Pay Item: Ketamine Induction")'
             elif service_line == 'KAP':
-                return 'No explicit amount documented in KB'
+                if enhanced_amount == 0.0:
+                    return 'No explicit amount documented in KB'
+                else:
+                    return f'${enhanced_amount:.2f} patient responsibility'
             elif service_line == 'Spravato':
                 return '$949 self-pay Spravato induction'
             elif service_line == 'Med Management (Psych E/M)':
-                return 'No self-pay policy'
+                if enhanced_amount == 0.0:
+                    return 'No self-pay policy'
+                else:
+                    return f'${enhanced_amount:.2f} patient responsibility'
         
-        # Default fallback
-        return 'Copay/coinsurance/deductible per eligibility'
+        # For all other cases, return calculated dollar amount or fallback text
+        if enhanced_amount > 0:
+            return f'${enhanced_amount:.2f} patient responsibility'
+        else:
+            return 'Copay/coinsurance/deductible per eligibility'
     
     def has_dollar_values(self, insurance: Dict, pverify_data: Dict) -> bool:
         """Check if any service line has specific dollar values (including $0)."""
         service_lines = ['IM ketamine', 'KAP', 'Spravato', 'Med Management (Psych E/M)']
         
         for service_line in service_lines:
-            responsibility = self.calculate_service_line_responsibility(insurance, pverify_data, service_line)
+            # Use enhanced calculation to get precise dollar amounts
+            enhanced_amount = self.calculate_service_line_responsibility_enhanced(insurance, pverify_data, service_line)
             
-            # Check if the responsibility contains dollar amounts (including $0) or percentages
-            if '$' in responsibility:
+            # If we get a specific dollar amount (including 0), consider it valuable
+            if enhanced_amount >= 0:
                 return True
-            if '%' in responsibility:
+            
+            # Also check the formatted responsibility text for dollar signs and percentages
+            responsibility = self.calculate_service_line_responsibility(insurance, pverify_data, service_line)
+            if '$' in responsibility or '%' in responsibility:
                 return True
         
         return False
