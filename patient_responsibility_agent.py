@@ -211,33 +211,67 @@ class AdvancedMDAPI:
             return []
     
     def has_appointments(self, patient_id: str) -> bool:
-        """Check if patient has appointments."""
+        """Check if patient has appointments using getpatientvisits API."""
         if not self.token:
             return False
             
-        try:
-            url = f"{self.api_base_url}/scheduler/Appointments"
-            params = {
-                'forView': 'patient',
-                'patientId': patient_id
+        payload = {
+            "ppmdmsg": {
+                "@action": "getpatientvisits",
+                "@patientid": patient_id,
+                "@class": "api",
+                "@nocookie": "0",
+                "visit": {
+                    "@color": "Color",
+                    "@duration": "Duration",
+                    "@refreason": "RefReason",
+                    "@apptstatus": "ApptStatus",
+                    "@ByRefProvMiddleName": "ByRefProvMiddleName",
+                    "@ByRefProvFirstName": "ByRefProvFirstName",
+                    "@ByRefProvLastName": "ByRefProvLastName",
+                    "@ByReferringProviderFID": "ByReferringProviderFID",
+                    "@columnheading": "ColumnHeading",
+                    "@AppointmentType": "AppointmentType",
+                    "@AppointmentTypeID": "AppointmentTypeID",
+                    "@Visitstartdatetime": "VisitStartDateTime"
+                },
+                "patient": {
+                    "@createdat": "CreatedAt",
+                    "@changedat": "ChangedAt",
+                    "@ssn": "SSN",
+                    "@name": "Name"
+                },
+                "insurance": {
+                    "@createdat": "CreatedAt",
+                    "@changedat": "ChangedAt",
+                    "@carcode": "CarCode",
+                    "@carname": "CarName"
+                }
             }
+        }
             
-            response = requests.get(
-                url,
+        try:
+            response = requests.post(
+                self.base_url,
                 headers={
                     'Cookie': f'token={self.token}',
-                    'Authorization': f'Bearer {self.token}'
+                    'Content-Type': 'application/json'
                 },
-                params=params
+                json=payload
             )
+            response.raise_for_status()
             
-            if response.status_code == 200:
-                appointments = response.json()
-                has_appts = len(appointments) > 0 if isinstance(appointments, list) else bool(appointments)
-                logger.debug(f"Patient {patient_id} has appointments: {has_appts}")
+            # Parse XML response
+            root = ET.fromstring(response.text)
+            results = root.find('.//Results')
+            
+            if results is not None:
+                visit_count = int(results.get('visitcount', '0'))
+                has_appts = visit_count > 0
+                logger.debug(f"Patient {patient_id} has {visit_count} visits/appointments: {has_appts}")
                 return has_appts
             else:
-                logger.warning(f"Failed to get appointments for patient {patient_id}: {response.status_code}")
+                logger.warning(f"No results found in response for patient {patient_id}")
                 return False
                 
         except Exception as e:
@@ -1254,23 +1288,67 @@ class PatientResponsibilityAgent:
         else:
             return 'Copay/coinsurance/deductible per eligibility'
     
-    def has_dollar_values(self, insurance: Dict, pverify_data: Dict) -> bool:
-        """Check if any service line has specific dollar values (including $0)."""
+    def should_post_memo(self, insurance: Dict, pverify_data: Dict) -> bool:
+        """
+        Determine if memo should be posted based on filtering rules:
+        - Do NOT post if memo has no dollar amounts and only "Per Elig" everywhere
+        - Do NOT post if memo has a mix of "Per Elig" and $0 amounts
+        - DO post if memo has AT LEAST one non-zero dollar amount, OR no "Per Elig" at all
+        """
         service_lines = ['IM ketamine', 'KAP', 'Spravato', 'Med Management (Psych E/M)']
         
-        for service_line in service_lines:
-            # Use enhanced calculation to get precise dollar amounts
-            enhanced_amount = self.calculate_service_line_responsibility_enhanced(insurance, pverify_data, service_line)
-            
-            # If we get a specific dollar amount (including 0), consider it valuable
-            if enhanced_amount >= 0:
-                return True
-            
-            # Also check the formatted responsibility text for dollar signs and percentages
-            responsibility = self.calculate_service_line_responsibility(insurance, pverify_data, service_line)
-            if '$' in responsibility or '%' in responsibility:
-                return True
+        has_per_elig = False
+        has_non_zero_dollar = False
+        has_zero_dollar = False
+        has_other_values = False
         
+        for service_line in service_lines:
+            # Get the formatted responsibility text (what appears in memo)
+            responsibility = self.calculate_service_line_responsibility(insurance, pverify_data, service_line)
+            resp_abbrev = self.get_responsibility_abbreviation(responsibility)
+            
+            # Check what type of value this is
+            if resp_abbrev == 'Per Elig':
+                has_per_elig = True
+            elif resp_abbrev == '$0' or resp_abbrev == '$0.00':
+                has_zero_dollar = True
+            elif resp_abbrev.startswith('$') and resp_abbrev not in ['$0', '$0.00']:
+                # Extract dollar amount to check if non-zero
+                import re
+                dollar_match = re.search(r'\$(\d+(?:\.\d{2})?)', resp_abbrev)
+                if dollar_match:
+                    amount = float(dollar_match.group(1))
+                    if amount > 0:
+                        has_non_zero_dollar = True
+                    else:
+                        has_zero_dollar = True
+            elif resp_abbrev.endswith('%') or resp_abbrev in ['No Policy', 'TBD']:
+                has_other_values = True
+        
+        # Apply filtering rules:
+        
+        # Rule 1: Do NOT post if only "Per Elig" everywhere
+        if has_per_elig and not has_non_zero_dollar and not has_zero_dollar and not has_other_values:
+            logger.debug(f"Filtering out memo: only 'Per Elig' values found")
+            return False
+        
+        # Rule 2: Do NOT post if mix of "Per Elig" and $0 amounts (no positive amounts or other values)
+        if has_per_elig and has_zero_dollar and not has_non_zero_dollar and not has_other_values:
+            logger.debug(f"Filtering out memo: mix of 'Per Elig' and $0 amounts only")
+            return False
+        
+        # Rule 3: DO post if AT LEAST one non-zero dollar amount
+        if has_non_zero_dollar:
+            logger.debug(f"Posting memo: has non-zero dollar amount")
+            return True
+        
+        # Rule 4: DO post if no "Per Elig" at all (even if all $0 or other values)
+        if not has_per_elig:
+            logger.debug(f"Posting memo: no 'Per Elig' values found")
+            return True
+        
+        # Default: do not post
+        logger.debug(f"Filtering out memo: does not meet posting criteria")
         return False
     
     def get_payer_abbreviation(self, payer_name: str) -> str:
@@ -1423,9 +1501,9 @@ class PatientResponsibilityAgent:
                         # Get PVerify data for this insurance
                         pverify_data = pverify_results.get(insurance['id'], {})
                         
-                        # Check if memo has any specific dollar values or percentages
-                        if not self.has_dollar_values(insurance, pverify_data):
-                            logger.info(f"Skipping memo for {patient['name']} - {insurance.get('carname')} (no specific dollar values)")
+                        # Check if memo should be posted based on filtering rules
+                        if not self.should_post_memo(insurance, pverify_data):
+                            logger.info(f"Skipping memo for {patient['name']} - {insurance.get('carname')} (filtered out per posting rules)")
                             continue
                         
                         # Generate comprehensive memo with all service lines
