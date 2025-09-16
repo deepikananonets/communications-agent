@@ -5,7 +5,7 @@ on:
   schedule:
     - cron: "0 6 * * *" # every day at midnight Denver time
     - cron: "0 12 * * *" # every day at 6 AM Denver time
-    - cron: "0 23 * * *" # every day at 7 PM Denver time
+    - cron: "0 23 * * *" # every day at 5 PM Denver time
 
 jobs:
   run:
