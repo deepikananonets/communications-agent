@@ -730,9 +730,17 @@ class PVerifyAPI:
             'deductible_met': 0.0
         }
         
-        # Check if eligibility status is inactive - return default values
-        status = eligibility_data.get('status', '').lower()
-        if status == 'inactive':
+        # Check if eligibility status is inactive or null - return default values
+        status = eligibility_data.get('status')
+        if status is None:
+            # Log additional error information if available
+            error_code = eligibility_data.get('errorCode')
+            error_description = eligibility_data.get('errorDescription')
+            if error_code or error_description:
+                logger.warning(f"PVerify eligibility error - Code: {error_code}, Description: {error_description}")
+            logger.debug("Eligibility status is null (likely error response), returning default financial data")
+            return financial_data
+        elif status.lower() == 'inactive':
             logger.debug("Eligibility status is inactive, returning default financial data")
             return financial_data
         
