@@ -755,7 +755,8 @@ class PVerifyAPI:
                             for param in in_network:
                                 if param:  # Add null check for individual param
                                     key = param.get('key', '').lower()
-                                    value = param.get('value', '').strip()
+                                    value = param.get('value') or ''
+                                    value = value.strip() if value else ''
                                     
                                     if 'co-pay' in key and value:
                                         try:
@@ -790,7 +791,8 @@ class PVerifyAPI:
                                                 for param in params:
                                                     if param:  # Add null check for individual param
                                                         key = param.get('key', '').lower()
-                                                        value = param.get('value', '').strip()
+                                                        value = param.get('value') or ''
+                                                        value = value.strip() if value else ''
                                                         
                                                         if 'co-payment' in key and value and '$' in value:
                                                             try:
