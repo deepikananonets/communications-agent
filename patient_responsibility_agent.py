@@ -161,7 +161,7 @@ class AdvancedMDAPI:
                 sex = patient_elem.get('sex')
                 
                 if not dob or not sex:
-                    logger.warning(f"Skipping patient {patient_elem.get('name')} - missing DOB or sex (DOB: {dob}, Sex: {sex})")
+                    logger.warning(f"Skipping the patient {patient_elem.get('name')} - missing DOB or sex (DOB: {dob}, Sex: {sex})")
                     continue
                 
                 patient_data = {
