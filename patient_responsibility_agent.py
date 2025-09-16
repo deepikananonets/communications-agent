@@ -127,7 +127,8 @@ class AdvancedMDAPI:
                     "@copaypercentageamount": "CopayPercentageAmount",
                     "@annualdeductible": "AnnualDeductible",
                     "@deductibleamountmet": "DeductibleAmountMet",
-                    "@subscriberid": "SubscriberID"
+                    "@subscriberid": "SubscriberID",
+                    "@subidnumber": "SubIdNumber"
                 },
                 "referralplan": {
                     "@reason": "Reason",
@@ -195,7 +196,8 @@ class AdvancedMDAPI:
                         'deductibleamountmet': float(insurance_elem.get('deductibleamountmet', 0)),
                         'createdat': insurance_elem.get('createdat'),
                         'changedat': insurance_elem.get('changedat'),
-                        'subscriberid': insurance_elem.get('subscriberid', '').strip() if insurance_elem.get('subscriberid') else ''
+                        'subscriberid': insurance_elem.get('subscriberid', '').strip() if insurance_elem.get('subscriberid') else '',
+                        'subidnumber': insurance_elem.get('subidnumber', '').strip() if insurance_elem.get('subidnumber') else ''
                     }
                     patient_data['insurances'].append(insurance_data)
                 
@@ -600,18 +602,31 @@ class PVerifyAPI:
         else:
             service_codes = ["30"]
         
-        # Get member ID - use subscriber ID from insurance or try discovery
+        # Get member ID - prioritize subidnumber, fallback to subscriberid, then discovery
+        subid_number = insurance.get('subidnumber')
         subscriber_id = insurance.get('subscriberid')
-        member_id = subscriber_id.strip() if subscriber_id else ''
+        member_id = ''
         payer_code = None
         
+        # First priority: use subidnumber if available
+        if subid_number and subid_number.strip():
+            member_id = subid_number.strip()
+            logger.debug(f"Using subIdNumber as member ID: {member_id}")
+        # Second priority: use subscriberid if available
+        elif subscriber_id and subscriber_id.strip():
+            member_id = subscriber_id.strip()
+            logger.debug(f"Using subscriberID as member ID: {member_id}")
+        
+        # Only run discovery if no member ID found from AMD data
         if not member_id:
+            logger.debug(f"No member ID in AMD data, attempting discovery for {patient.get('name')} - {insurance.get('carname')}")
             # Try insurance discovery to find member ID
             discovery_result = self.insurance_discovery(patient)
             if discovery_result and discovery_result.get('PayerFound'):
                 # Check if discovered insurance matches AMD insurance
                 if self.match_insurance_name(insurance.get('carname', ''), discovery_result.get('PayerName', '')):
                     member_id = discovery_result.get('MemberID', '')
+                    logger.debug(f"Found member ID via discovery: {member_id}")
                     # Extract payer code if available
                     if 'ComboPayerResponses' in discovery_result:
                         for payer_resp in discovery_result['ComboPayerResponses']:
