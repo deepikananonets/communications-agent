@@ -444,6 +444,10 @@ class PVerifyAPI:
         }
         
         try:
+            logger.debug(f"PVerify Token Request - URL: {self.token_url}")
+            logger.debug(f"PVerify Token Request - Headers: {{'Content-Type': 'application/x-www-form-urlencoded'}}")
+            logger.debug(f"PVerify Token Request - Payload: {{'Client_Id': '{self.client_id}', 'grant_type': 'client_credentials', 'Client_Secret': '[REDACTED]'}}")
+            
             response = requests.post(
                 self.token_url,
                 headers={'Content-Type': 'application/x-www-form-urlencoded'},
@@ -451,7 +455,12 @@ class PVerifyAPI:
             )
             response.raise_for_status()
             
+            logger.debug(f"PVerify Token Response - Status: {response.status_code}")
+            logger.debug(f"PVerify Token Response - Headers: {dict(response.headers)}")
+            
             token_data = response.json()
+            logger.debug(f"PVerify Token Response - Body: {{'access_token': '[REDACTED]', 'expires_in': {token_data.get('expires_in', 'N/A')}, 'token_type': '{token_data.get('token_type', 'N/A')}'}}")
+            
             self.access_token = token_data['access_token']
             expires_in = token_data.get('expires_in', 3600)  # Default 1 hour
             self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
@@ -461,6 +470,9 @@ class PVerifyAPI:
             
         except Exception as e:
             logger.error(f"Failed to get PVerify access token: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"PVerify Token Error Response - Status: {e.response.status_code}")
+                logger.error(f"PVerify Token Error Response - Body: {e.response.text}")
             return False
     
     def match_insurance_name(self, amd_insurance_name: str, pverify_payer_name: str) -> bool:
@@ -557,6 +569,10 @@ class PVerifyAPI:
         }
         
         try:
+            logger.debug(f"PVerify Discovery Request - URL: {self.discovery_url}")
+            logger.debug(f"PVerify Discovery Request - Headers: {{'Authorization': 'Bearer [REDACTED]', 'Client-API-Id': '{self.client_id}', 'Content-Type': 'application/json'}}")
+            logger.debug(f"PVerify Discovery Request - Patient: {patient.get('name')} - Payload: {json.dumps(payload, indent=2)}")
+            
             response = requests.post(
                 self.discovery_url,
                 headers={
@@ -568,12 +584,19 @@ class PVerifyAPI:
             )
             response.raise_for_status()
             
+            logger.debug(f"PVerify Discovery Response - Status: {response.status_code}")
+            logger.debug(f"PVerify Discovery Response - Headers: {dict(response.headers)}")
+            
             discovery_data = response.json()
+            logger.debug(f"PVerify Discovery Response - Patient: {patient.get('name')} - Body: {json.dumps(discovery_data, indent=2)}")
             logger.debug(f"Insurance discovery for {patient.get('name')}: {discovery_data.get('PayerName', 'No payer found')}")
             return discovery_data
             
         except Exception as e:
             logger.error(f"Insurance discovery failed for {patient.get('name')}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"PVerify Discovery Error Response - Status: {e.response.status_code}")
+                logger.error(f"PVerify Discovery Error Response - Body: {e.response.text}")
             return None
     
     def eligibility_check(self, patient: Dict, insurance: Dict, service_line: str = "NA") -> Dict:
@@ -666,6 +689,10 @@ class PVerifyAPI:
         }
         
         try:
+            logger.debug(f"PVerify Eligibility Request - URL: {self.eligibility_url}")
+            logger.debug(f"PVerify Eligibility Request - Headers: {{'Authorization': 'Bearer [REDACTED]', 'Client-API-Id': '{self.client_id}', 'Content-Type': 'application/json'}}")
+            logger.debug(f"PVerify Eligibility Request - Patient: {patient.get('name')} - Insurance: {insurance.get('carname')} - Payload: {json.dumps(payload, indent=2)}")
+            
             response = requests.post(
                 self.eligibility_url,
                 headers={
@@ -677,12 +704,19 @@ class PVerifyAPI:
             )
             response.raise_for_status()
             
+            logger.debug(f"PVerify Eligibility Response - Status: {response.status_code}")
+            logger.debug(f"PVerify Eligibility Response - Headers: {dict(response.headers)}")
+            
             eligibility_data = response.json()
+            logger.debug(f"PVerify Eligibility Response - Patient: {patient.get('name')} - Insurance: {insurance.get('carname')} - Body: {json.dumps(eligibility_data, indent=2)}")
             logger.info(f"Eligibility check completed for {patient.get('name')} - Status: {eligibility_data.get('status', 'Unknown')}")
             return eligibility_data
             
         except Exception as e:
             logger.error(f"Eligibility check failed for {patient.get('name')}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"PVerify Eligibility Error Response - Status: {e.response.status_code}")
+                logger.error(f"PVerify Eligibility Error Response - Body: {e.response.text}")
             return {}
     
     def extract_financial_data(self, eligibility_data: Dict) -> Dict:
@@ -696,77 +730,92 @@ class PVerifyAPI:
             'deductible_met': 0.0
         }
         
+        # Check if eligibility status is inactive - return default values
+        status = eligibility_data.get('status', '').lower()
+        if status == 'inactive':
+            logger.debug("Eligibility status is inactive, returning default financial data")
+            return financial_data
+        
         try:
             # Check networkSections for summary data
             network_sections = eligibility_data.get('networkSections', [])
-            for section in network_sections:
-                if section.get('identifier') == 'Specialist':
-                    in_network = section.get('inNetworkParameters', [])
-                    for param in in_network:
-                        key = param.get('key', '').lower()
-                        value = param.get('value', '').strip()
-                        
-                        if 'co-pay' in key and value:
-                            try:
-                                financial_data['copay'] = float(value.replace('$', '').replace(',', ''))
-                            except ValueError:
-                                pass
-                        elif 'co-ins' in key and value:
-                            try:
-                                financial_data['coinsurance'] = float(value.replace('%', ''))
-                            except ValueError:
-                                pass
+            if network_sections:  # Add null check
+                for section in network_sections:
+                    if section and section.get('identifier') == 'Specialist':
+                        in_network = section.get('inNetworkParameters', [])
+                        if in_network:  # Add null check
+                            for param in in_network:
+                                if param:  # Add null check for individual param
+                                    key = param.get('key', '').lower()
+                                    value = param.get('value', '').strip()
+                                    
+                                    if 'co-pay' in key and value:
+                                        try:
+                                            financial_data['copay'] = float(value.replace('$', '').replace(',', ''))
+                                        except ValueError:
+                                            pass
+                                    elif 'co-ins' in key and value:
+                                        try:
+                                            financial_data['coinsurance'] = float(value.replace('%', ''))
+                                        except ValueError:
+                                            pass
             
             # Check detailed service types for more comprehensive data
             service_types = eligibility_data.get('servicesTypes', [])
-            for service_type in service_types:
-                service_name = service_type.get('serviceTypeName', '')
-                
-                # Focus on relevant service types
-                if any(keyword in service_name.lower() for keyword in ['professional', 'physician', 'office']):
-                    sections = service_type.get('serviceTypeSections', [])
-                    
-                    for section in sections:
-                        label = section.get('label', '')
-                        if 'in plan-network' in label.lower() or 'applies to' in label.lower():
-                            params = section.get('serviceParameters', [])
+            if service_types:  # Add null check
+                for service_type in service_types:
+                    if service_type:  # Add null check
+                        service_name = service_type.get('serviceTypeName', '')
+                        
+                        # Focus on relevant service types
+                        if any(keyword in service_name.lower() for keyword in ['professional', 'physician', 'office']):
+                            sections = service_type.get('serviceTypeSections', [])
                             
-                            for param in params:
-                                key = param.get('key', '').lower()
-                                value = param.get('value', '').strip()
-                                
-                                if 'co-payment' in key and value and '$' in value:
-                                    try:
-                                        copay_val = float(value.replace('$', '').replace(',', ''))
-                                        if copay_val > financial_data['copay']:
-                                            financial_data['copay'] = copay_val
-                                    except ValueError:
-                                        pass
-                                elif 'co-insurance' in key and value and '%' in value:
-                                    try:
-                                        coins_val = float(value.replace('%', ''))
-                                        if coins_val > financial_data['coinsurance']:
-                                            financial_data['coinsurance'] = coins_val
-                                    except ValueError:
-                                        pass
-                                elif 'deductible' in key and value and '$' in value:
-                                    try:
-                                        deduct_val = float(value.replace('$', '').replace(',', ''))
-                                        if 'remaining' in key or 'left' in key or 'balance' in key:
-                                            if deduct_val > financial_data['deductible_remaining']:
-                                                financial_data['deductible_remaining'] = deduct_val
-                                        elif 'met' in key or 'satisfied' in key:
-                                            if deduct_val > financial_data['deductible_met']:
-                                                financial_data['deductible_met'] = deduct_val
-                                        elif 'annual' in key or 'yearly' in key:
-                                            if deduct_val > financial_data['annual_deductible']:
-                                                financial_data['annual_deductible'] = deduct_val
-                                        else:
-                                            # Generic deductible - could be annual or remaining
-                                            if deduct_val > financial_data['deductible']:
-                                                financial_data['deductible'] = deduct_val
-                                    except ValueError:
-                                        pass
+                            if sections:  # Add null check
+                                for section in sections:
+                                    if section:  # Add null check
+                                        label = section.get('label', '')
+                                        if 'in plan-network' in label.lower() or 'applies to' in label.lower():
+                                            params = section.get('serviceParameters', [])
+                                            
+                                            if params:  # Add null check
+                                                for param in params:
+                                                    if param:  # Add null check for individual param
+                                                        key = param.get('key', '').lower()
+                                                        value = param.get('value', '').strip()
+                                                        
+                                                        if 'co-payment' in key and value and '$' in value:
+                                                            try:
+                                                                copay_val = float(value.replace('$', '').replace(',', ''))
+                                                                if copay_val > financial_data['copay']:
+                                                                    financial_data['copay'] = copay_val
+                                                            except ValueError:
+                                                                pass
+                                                        elif 'co-insurance' in key and value and '%' in value:
+                                                            try:
+                                                                coins_val = float(value.replace('%', ''))
+                                                                if coins_val > financial_data['coinsurance']:
+                                                                    financial_data['coinsurance'] = coins_val
+                                                            except ValueError:
+                                                                pass
+                                                        elif 'deductible' in key and value and '$' in value:
+                                                            try:
+                                                                deduct_val = float(value.replace('$', '').replace(',', ''))
+                                                                if 'remaining' in key or 'left' in key or 'balance' in key:
+                                                                    if deduct_val > financial_data['deductible_remaining']:
+                                                                        financial_data['deductible_remaining'] = deduct_val
+                                                                elif 'met' in key or 'satisfied' in key:
+                                                                    if deduct_val > financial_data['deductible_met']:
+                                                                        financial_data['deductible_met'] = deduct_val
+                                                                elif 'annual' in key or 'yearly' in key:
+                                                                    if deduct_val > financial_data['annual_deductible']:
+                                                                        financial_data['annual_deductible'] = deduct_val
+                                                                else:
+                                                                    # Generic deductible - could be annual or remaining
+                                                                    if deduct_val > financial_data['deductible']:
+                                                                        financial_data['deductible'] = deduct_val
+                                                            except ValueError:
+                                                                pass
             
             # Calculate deductible_remaining if we have annual and met amounts
             if financial_data['annual_deductible'] > 0 and financial_data['deductible_met'] >= 0:
