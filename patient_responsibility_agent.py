@@ -977,6 +977,42 @@ def log_agent_run_success(patient_memo: str, started_at_utc: datetime, ended_at_
     except Exception as e:
         logger.error(f"Failed to write agent_run_logs: {e}", exc_info=True)
 
+
+def log_agent_run_skipped(reason: str, started_at_utc: datetime, ended_at_utc: datetime, documents_processed: int = 0):
+    """
+    Inserts a 'skipped' row into agent_run_logs (e.g., filtered by posting rules).
+    """
+    output_payload = psycopg2.extras.Json({"message": reason})
+
+    sql = """
+        INSERT INTO agent_run_logs 
+          (agent_id, service_request_id, documents_processed, status,
+           output_data, start_time, end_time, call_id, vapi_listen_url,
+           vapi_control_url, manual_trigger)
+        VALUES
+          (%s::uuid, NULL::int, %s::int, %s, %s, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
+    """
+    args = (
+        str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),
+        int(documents_processed),
+        "skipped",                               # <-- status
+        output_payload,
+        started_at_utc,
+        ended_at_utc,
+        False,
+    )
+
+    try:
+        with _pg_conn_via_ssh() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, args)
+            conn.commit()
+        logger.info("agent_run_logs: skipped row inserted")
+    except Exception as e:
+        logger.error(f"Failed to write agent_run_logs skipped: {e}", exc_info=True)
+
+
+
 def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_utc: datetime):
     """
     Inserts an error row into agent_run_logs.
@@ -1578,6 +1614,13 @@ class PatientResponsibilityAgent:
                         # Check if memo should be posted based on filtering rules
                         if not self.should_post_memo(insurance, pverify_data):
                             logger.info(f"Skipping memo for {patient['name']} - {insurance.get('carname')} (filtered out per posting rules)")
+                            skip_time = utc_now()
+                            log_agent_run_skipped(
+                                reason=f"Skipped due to posting rules. Patient: {patient['name']} | Insurance: {insurance.get('carname')} | Memo preview: {memo_text}",
+                                started_at_utc=skip_time,
+                                ended_at_utc=skip_time,
+                                documents_processed=0
+                            )
                             continue
                         
                         # Generate comprehensive memo with all service lines
