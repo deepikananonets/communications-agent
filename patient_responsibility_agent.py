@@ -1611,6 +1611,11 @@ class PatientResponsibilityAgent:
                         # Get PVerify data for this insurance
                         pverify_data = pverify_results.get(insurance['id'], {})
                         
+                        memo_text = ""
+                        
+                        # Generate comprehensive memo with all service lines
+                        memo_text = self.generate_comprehensive_memo(patient, insurance, pverify_data)
+                        
                         # Check if memo should be posted based on filtering rules
                         if not self.should_post_memo(insurance, pverify_data):
                             logger.info(f"Skipping memo for {patient['name']} - {insurance.get('carname')} (filtered out per posting rules)")
@@ -1623,8 +1628,6 @@ class PatientResponsibilityAgent:
                             )
                             continue
                         
-                        # Generate comprehensive memo with all service lines
-                        memo_text = self.generate_comprehensive_memo(patient, insurance, pverify_data)
                         
                         # Post memo to AMD
                         success = self.amd_api.post_memo(patient['id'], memo_text)
