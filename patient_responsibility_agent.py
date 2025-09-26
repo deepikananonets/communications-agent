@@ -941,6 +941,14 @@ def _pg_conn_via_ssh():
     finally:
         server.stop()
 
+
+def _is_financial_data_empty(self, fin: Dict) -> bool:
+    return all((fin.get(k, 0) or 0) == 0 for k in [
+        'copay','coinsurance','deductible','deductible_remaining',
+        'annual_deductible','deductible_met'
+    ])
+
+
 def log_agent_run_success(patient_memo: str, started_at_utc: datetime, ended_at_utc: datetime, documents_processed: int = 1):
     """
     Inserts a success row into agent_run_logs with explicit casts to match DB types.
@@ -1299,6 +1307,13 @@ class PatientResponsibilityAgent:
         
         # Get financial data
         pverify_financial = pverify_data.get('financial_data', {})
+
+        # --- NEW: detect "Per Elig / zeros" fallback condition ---
+        fallback_needed = (
+            (pverify_status is None) or
+            (isinstance(pverify_status, str) and pverify_status.lower() == 'inactive') or
+            self._is_financial_data_empty(pverify_financial)
+        )
         
         # Get copay, coinsurance, and deductible data (PVerify priority, AMD fallback)
         copay_amount = pverify_financial.get('copay', 0) or insurance.get('copaydollaramount', 0)
@@ -1311,6 +1326,19 @@ class PatientResponsibilityAgent:
         if deductible_remaining == 0 and annual_deductible > 0:
             deductible_remaining = max(0, annual_deductible - deductible_met)
         
+        # --- NEW: apply fallback if everything came back "Per Elig"/Inactive/zeros ---
+        if fallback_needed:
+            # keep AMD copay if present; otherwise estimate using coinsurance + AMD deductible
+            if copay_amount <= 0:
+                # use AMD coins%, else a safe default (20%) from config if present
+                default_coins = getattr(config, 'DEFAULT_COINSURANCE_PCT', 20.0)
+                coinsurance_pct = coinsurance_pct or default_coins
+            # recompute deductible remaining purely from AMD (if available)
+            deductible_remaining = max(0.0, amd_annual - amd_met) if (amd_annual or amd_met) else 0.0
+
+
+
+    
         # If we have a copay, use it (traditional copay plan)
         if copay_amount > 0:
             return copay_amount
