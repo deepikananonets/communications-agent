@@ -1290,6 +1290,12 @@ class PatientResponsibilityAgent:
     def calculate_service_line_responsibility_enhanced(self, insurance: Dict, pverify_data: Dict, service_line: str) -> float:
         """Calculate patient responsibility using deductible and coinsurance with allowed amounts."""
         payer_type = self.get_payer_type(insurance)
+
+        amd_copay = float(insurance.get('copaydollaramount') or 0)
+        amd_coins_pct = float(insurance.get('copaypercentageamount') or 0)
+        amd_annual = float(insurance.get('annualdeductible') or 0)
+        amd_met = float(insurance.get('deductibleamountmet') or 0)
+
         
         # Medicaid overrides - return 0 for specific service lines
         if payer_type == 'Medicaid':
