@@ -38,6 +38,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def memo_already_logged(patient_name: str, insurance_name: str, memo_text: str, lookback_days: int = 90) -> bool:
+    """
+    Returns True if an identical memo was already logged for this patient (success or skipped)
+    within the lookback window. We match on the exact memo text + patient name.
+    """
+    # Patterns that match how we currently log messages
+    success_msg = f"Patient: {patient_name} | Memo: {memo_text}"
+    skipped_msg = f"SKIPPED by posting rules. Patient: {patient_name} | Insurance: {insurance_name} | Memo preview: {memo_text}"
+
+    sql = """
+        SELECT 1
+        FROM agent_run_logs
+        WHERE agent_id = %s::uuid
+          AND status IN ('success','skipped')
+          AND start_time >= (NOW() AT TIME ZONE 'UTC' - (%s || ' days')::interval)
+          AND (
+                output_data->>'message' = %s
+             OR output_data->>'message' = %s
+          )
+        LIMIT 1
+    """
+    args = (
+        str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),
+        lookback_days,
+        success_msg,
+        skipped_msg,
+    )
+    try:
+        with _pg_conn_via_ssh() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, args)
+                return cur.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Failed duplicate-memo check: {e}", exc_info=True)
+        # Be safe: if the check fails, do NOT block posting/logging
+        return False
+
+    
+
 class AdvancedMDAPI:
     """AdvancedMD API client for patient and insurance management."""
     
@@ -320,43 +360,6 @@ class AdvancedMDAPI:
             
         return None
     
-    def memo_already_logged(patient_name: str, insurance_name: str, memo_text: str, lookback_days: int = 90) -> bool:
-        """
-        Returns True if an identical memo was already logged for this patient (success or skipped)
-        within the lookback window. We match on the exact memo text + patient name.
-        """
-        # Patterns that match how we currently log messages
-        success_msg = f"Patient: {patient_name} | Memo: {memo_text}"
-        skipped_msg = f"SKIPPED by posting rules. Patient: {patient_name} | Insurance: {insurance_name} | Memo preview: {memo_text}"
-    
-        sql = """
-            SELECT 1
-            FROM agent_run_logs
-            WHERE agent_id = %s::uuid
-              AND status IN ('success','skipped')
-              AND start_time >= (NOW() AT TIME ZONE 'UTC' - (%s || ' days')::interval)
-              AND (
-                    output_data->>'message' = %s
-                 OR output_data->>'message' = %s
-              )
-            LIMIT 1
-        """
-        args = (
-            str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),
-            lookback_days,
-            success_msg,
-            skipped_msg,
-        )
-        try:
-            with _pg_conn_via_ssh() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(sql, args)
-                    return cur.fetchone() is not None
-        except Exception as e:
-            logger.error(f"Failed duplicate-memo check: {e}", exc_info=True)
-            # Be safe: if the check fails, do NOT block posting/logging
-            return False
-
     
     
     
@@ -982,7 +985,7 @@ def _pg_conn_via_ssh():
         server.stop()
 
 
-def _is_financial_data_empty(self, fin: Dict) -> bool:
+def _is_financial_data_empty(fin: Dict) -> bool:
     return all((fin.get(k, 0) or 0) == 0 for k in [
         'copay','coinsurance','deductible','deductible_remaining',
         'annual_deductible','deductible_met'
@@ -1360,7 +1363,7 @@ class PatientResponsibilityAgent:
         fallback_needed = (
             (pverify_status is None) or
             (isinstance(pverify_status, str) and pverify_status.lower() == 'inactive') or
-            self._is_financial_data_empty(pverify_financial)
+            _is_financial_data_empty(pverify_financial)
         )
         
         # Get copay, coinsurance, and deductible data (PVerify priority, AMD fallback)
