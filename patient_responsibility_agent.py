@@ -1306,7 +1306,9 @@ class PatientResponsibilityAgent:
             # For KAP and Med Management, continue with calculation (no explicit amounts)
         
         # Get financial data
-        pverify_financial = pverify_data.get('financial_data', {})
+        pverify_data = pverify_data or {}
+        pverify_financial = pverify_data.get('financial_data', {}) or {}
+        pverify_status = (pverify_data.get('eligibility_data') or {}).get('status')
 
         # --- NEW: detect "Per Elig / zeros" fallback condition ---
         fallback_needed = (
