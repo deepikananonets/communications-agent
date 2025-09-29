@@ -320,6 +320,46 @@ class AdvancedMDAPI:
             
         return None
     
+    def memo_already_logged(patient_name: str, insurance_name: str, memo_text: str, lookback_days: int = 90) -> bool:
+        """
+        Returns True if an identical memo was already logged for this patient (success or skipped)
+        within the lookback window. We match on the exact memo text + patient name.
+        """
+        # Patterns that match how we currently log messages
+        success_msg = f"Patient: {patient_name} | Memo: {memo_text}"
+        skipped_msg = f"SKIPPED by posting rules. Patient: {patient_name} | Insurance: {insurance_name} | Memo preview: {memo_text}"
+    
+        sql = """
+            SELECT 1
+            FROM agent_run_logs
+            WHERE agent_id = %s::uuid
+              AND status IN ('success','skipped')
+              AND start_time >= (NOW() AT TIME ZONE 'UTC' - (%s || ' days')::interval)
+              AND (
+                    output_data->>'message' = %s
+                 OR output_data->>'message' = %s
+              )
+            LIMIT 1
+        """
+        args = (
+            str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),
+            lookback_days,
+            success_msg,
+            skipped_msg,
+        )
+        try:
+            with _pg_conn_via_ssh() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, args)
+                    return cur.fetchone() is not None
+        except Exception as e:
+            logger.error(f"Failed duplicate-memo check: {e}", exc_info=True)
+            # Be safe: if the check fails, do NOT block posting/logging
+            return False
+
+    
+    
+    
     def check_eligibility_response(self, eligibility_id: str) -> Dict:
         """Check eligibility response."""
         if not self.token:
@@ -1651,6 +1691,11 @@ class PatientResponsibilityAgent:
                         
                         # Generate comprehensive memo with all service lines
                         memo_text = self.generate_comprehensive_memo(patient, insurance, pverify_data)
+
+                        # 🚫 De-dupe: if we already logged this exact memo for this patient, skip everything
+                        if memo_already_logged(patient['name'], insurance.get('carname',''), memo_text):
+                            logger.info(f"Duplicate memo detected — skipping post & DB log for {patient['name']} - {insurance.get('carname')}")
+                            continue
                         
                         # Check if memo should be posted based on filtering rules
                         if not self.should_post_memo(insurance, pverify_data):
