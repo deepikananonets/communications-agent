@@ -1112,6 +1112,7 @@ class PatientResponsibilityAgent:
         self._init_service_line_mappings()
         self._init_payer_mappings()
         self._init_allowed_amounts()
+        self._init_paid_amounts()
     
     def _init_service_line_mappings(self):
         """Initialize service line to CPT code mappings."""
@@ -1187,6 +1188,57 @@ class PatientResponsibilityAgent:
             }
         }
 
+        def _init_paid_amounts(self):
+            """Initialize paid amounts lookup table."""
+            # NOTE: Omit CPT keys where your sheet shows N/A. No Nones.
+            self.paid_amounts = {
+                'HFM': {
+                    '99215': 143.37, 'G2083': 1146.12, '99417-4': 148.82, '99417-2': 86.38,
+                    '90837': 28.51, '99417-3': 127.97, '96372-59': 28.02, '99215-25': 69.73,
+                    '99214': 99.44, 'J3490': 0.03, 'G2212': 105.03, '99417-5': 197.49,
+                    '99417': 57.50, 'J3490-GA': 0.14, '96130': 3.64, '99205-25': 186.21,
+                    'G2082': 784.40, '99204-25': 182.92, '90791': 152.36, '99417-6': 256.17,
+                    '96372': 15.71, '99205-95': 154.17, '99204': 128.51, '96130-59': 34.59
+                },
+                'TBS': {
+                    '99215': 109.04, 'G2083': 482.83, '99417-4': 81.77, '99417-2': 43.67,
+                    '90837': 44.09, '99417-3': 59.31, '96372-59': 20.45, '99215-25': 86.94,
+                    '99214': 77.48, 'J3490': 1.11, 'G2212': 41.15, '99417-5': 93.02,
+                    '99417': 33.41, 'J3490-GA': 0.06, '96130': 44.32, '99205-25': 110.50,
+                    '99204-25': 84.36, '90791': 9.89, '99417-6': 72.92, '96372': 19.18,
+                    'S0013-84': 412.67, '99204': 98.98, '96130-59': 49.05
+                },
+                'ANT': {
+                    '99215': 158.99, 'G2083': 864.40, '99417-4': 93.40, '99417-2': 57.69,
+                    '90837': 70.81, '99417-3': 89.36, '96372-59': 23.50, '99215-25': 132.54,
+                    '99214': 91.76, 'J3490': 0.03, '99417-5': 99.44, '99417': 42.04,
+                    'J3490-GA': 0.01, '96130': 70.11, '99205-25': 105.03, 'G2082': 457.22,
+                    '99204-25': 136.79, '90791': 73.58, '99417-6': 116.32, '96372': 16.34,
+                    '99205-95': 260.29, '99204': 146.66, '96130-59': 69.26
+                    # (G2212 paid was N/A in the sheet → intentionally omitted)
+                },
+                'COA': {
+                    '99215': 149.29, 'G2083': 1246.12, '99417-4': 174.28, '99417-2': 87.14,
+                    '90837': 112.71, '99417-3': 130.71, '96372-59': 22.34, '99214': 96.00,
+                    '99417': 29.05, '96130': 2.45, '99205-25': 186.02, '99204-25': 136.94,
+                    '90791': 149.18, '96372': 9.93, '99205-95': 188.01, '99204': 136.94,
+                    '96130-59': 150.00
+                },
+                'UHC': {
+                    '99215': 125.04, '99417-4': 42.63, '99417-2': 48.43, '90837': 43.21,
+                    '99417-3': 52.55, '96372-59': 22.62, '99215-25': 87.36, '99214': 71.03,
+                    'J3490': 2.52, 'G2212': 78.24, '99417': 13.13, 'J3490-GA': 1.52,
+                    '96130': 16.65, '99205-25': 89.23, '99204-25': 109.42, '90791': 66.02,
+                    '99417-6': 78.75, '96372': 15.70, '99204': 62.66, '96130-59': 44.73
+                    # (99417-5 paid was N/A in the sheet → intentionally omitted)
+                }
+                # MCR paid cells not clearly visible in the screenshot → leave out for now.
+            }
+
+
+    
+    
+    
     def get_payer_code(self, insurance_name: str) -> Optional[str]:
         """Map insurance name to payer code for allowed amounts lookup."""
         insurance_upper = insurance_name.upper().strip()
@@ -1218,6 +1270,29 @@ class PatientResponsibilityAgent:
         
         return sum(amounts) / len(amounts) if amounts else 0.0
 
+    
+    def get_average_patient_share(self, cpt_code: str) -> float:
+        """
+        Average patient share for a CPT across all payers with data.
+        Rule per payer:
+          - If Allowed and Paid exist → share = max(0, Allowed - Paid)
+          - If Allowed exists but Paid missing → share = Allowed
+          - If no Allowed → ignore that payer
+        """
+        shares = []
+        for payer_code, allowed_map in self.allowed_amounts.items():
+            allowed = allowed_map.get(cpt_code)
+            if allowed is None:
+                continue
+            paid = (self.paid_amounts.get(payer_code, {}) or {}).get(cpt_code)
+            if paid is None:
+                shares.append(float(allowed))
+            else:
+                shares.append(max(0.0, float(allowed) - float(paid)))
+        return round(sum(shares) / len(shares), 2) if shares else 0.0
+
+    
+    
     def is_medicaid_insurance(self, insurance: Dict) -> bool:
         """Check if insurance is Medicaid based on carcode or carname."""
         carcode = insurance.get('carcode', '').upper()
@@ -1330,109 +1405,78 @@ class PatientResponsibilityAgent:
         # Default to Commercial
         return 'Commercial'
     
+
+
     def calculate_service_line_responsibility_enhanced(self, insurance: Dict, pverify_data: Dict, service_line: str) -> float:
-        """Calculate patient responsibility using deductible and coinsurance with allowed amounts."""
+        """
+        Calculate patient responsibility using the Allowed vs Paid table.
+    
+        Rules:
+        - Medicaid: $0 for ALL service lines (no PR).
+        - Self-Pay: IM=$399, Spravato=$949 (overrides). Others fall through.
+        - Otherwise, for each CPT in the service line:
+            * If both Allowed and Paid exist for payer: use max(Allowed - Paid, 0).
+            * If Allowed exists but Paid missing: use Allowed.
+            * If both missing (or payer not mapped for that CPT):
+                  use average patient share across payers where both exist;
+                  if none exist, use average Allowed.
+        """
         payer_type = self.get_payer_type(insurance)
-
-        amd_copay = float(insurance.get('copaydollaramount') or 0)
-        amd_coins_pct = float(insurance.get('copaypercentageamount') or 0)
-        amd_annual = float(insurance.get('annualdeductible') or 0)
-        amd_met = float(insurance.get('deductibleamountmet') or 0)
-
-        
-        # Medicaid overrides - return 0 for specific service lines
+    
+        # Medicaid overrides — ALL service lines → $0 PR
         if payer_type == 'Medicaid':
-            if service_line in ['IM ketamine', 'KAP']:
-                return 0.0
-            # For Spravato and Med Management, continue with calculation
-        
-        # Self-Pay overrides - return fixed amounts
+            return 0.0
+    
+        # Self-Pay overrides
         if payer_type == 'Self-Pay':
             if service_line == 'IM ketamine':
                 return 399.0
-            elif service_line == 'Spravato':
+            if service_line == 'Spravato':
                 return 949.0
-            # For KAP and Med Management, continue with calculation (no explicit amounts)
-        
-        # Get financial data
-        pverify_data = pverify_data or {}
-        pverify_financial = pverify_data.get('financial_data', {}) or {}
-        pverify_status = (pverify_data.get('eligibility_data') or {}).get('status')
-
-        # --- NEW: detect "Per Elig / zeros" fallback condition ---
-        fallback_needed = (
-            (pverify_status is None) or
-            (isinstance(pverify_status, str) and pverify_status.lower() == 'inactive') or
-            _is_financial_data_empty(pverify_financial)
-        )
-        
-        # Get copay, coinsurance, and deductible data (PVerify priority, AMD fallback)
-        copay_amount = pverify_financial.get('copay', 0) or insurance.get('copaydollaramount', 0)
-        coinsurance_pct = pverify_financial.get('coinsurance', 0) or insurance.get('copaypercentageamount', 0)
-        deductible_remaining = pverify_financial.get('deductible_remaining', 0)
-        annual_deductible = pverify_financial.get('annual_deductible', 0) or insurance.get('annualdeductible', 0)
-        deductible_met = pverify_financial.get('deductible_met', 0) or insurance.get('deductibleamountmet', 0)
-        
-        # Calculate remaining deductible if not available from PVerify
-        if deductible_remaining == 0 and annual_deductible > 0:
-            deductible_remaining = max(0, annual_deductible - deductible_met)
-        
-        # --- NEW: apply fallback if everything came back "Per Elig"/Inactive/zeros ---
-        if fallback_needed:
-            # keep AMD copay if present; otherwise estimate using coinsurance + AMD deductible
-            if copay_amount <= 0:
-                # use AMD coins%, else a safe default (20%) from config if present
-                default_coins = getattr(config, 'DEFAULT_COINSURANCE_PCT', 20.0)
-                coinsurance_pct = coinsurance_pct or default_coins
-            # recompute deductible remaining purely from AMD (if available)
-            deductible_remaining = max(0.0, amd_annual - amd_met) if (amd_annual or amd_met) else 0.0
-
-
-
+            # For other self-pay lines, fall through to table-based estimate (rare)
     
-        # If we have a copay, use it (traditional copay plan)
-        if copay_amount > 0:
-            return copay_amount
-        
-        # Get CPT codes for this service line
+        # Get CPTs for this service line
         cpt_codes = self.service_line_cpt_mapping.get(service_line, [])
         if not cpt_codes:
             return 0.0
-        
-        # Get payer code for allowed amounts lookup
-        insurance_name = insurance.get('carname', '')
+    
+        insurance_name = insurance.get('carname', '') or ''
         payer_code = self.get_payer_code(insurance_name)
-        
-        # Calculate total allowed amount for all CPT codes in this service line
-        total_allowed = 0.0
-        for cpt_code in cpt_codes:
-            if payer_code and cpt_code in self.allowed_amounts.get(payer_code, {}):
-                allowed_amount = self.allowed_amounts[payer_code][cpt_code]
-            else:
-                # Use average if payer not found or CPT not available for payer
-                allowed_amount = self.get_average_allowed_amount(cpt_code)
-            total_allowed += allowed_amount
-        
-        if total_allowed == 0:
-            return 0.0
-        
-        # Calculate patient responsibility
-        patient_responsibility = 0.0
-        
-        # Apply deductible first
-        if deductible_remaining > 0:
-            deductible_portion = min(total_allowed, deductible_remaining)
-            patient_responsibility += deductible_portion
-            remaining_after_deductible = total_allowed - deductible_portion
-        else:
-            remaining_after_deductible = total_allowed
-        
-        # Apply coinsurance to remaining amount
-        if coinsurance_pct > 0 and remaining_after_deductible > 0:
-            coinsurance_portion = remaining_after_deductible * (coinsurance_pct / 100.0)
-            patient_responsibility += coinsurance_portion
-        
-        return round(patient_responsibility, 2)
+    
+        def avg_patient_share_for_cpt(cpt: str) -> float:
+            """Average of (Allowed - Paid) across all payers where both exist; fallback to average Allowed."""
+            shares: List[float] = []
+            for p, a_map in self.allowed_amounts.items():
+                a = a_map.get(cpt)
+                b = self.paid_amounts.get(p, {}).get(cpt) if hasattr(self, 'paid_amounts') else None
+                if a is not None and b is not None:
+                    shares.append(max(0.0, a - b))
+            if shares:
+                return sum(shares) / len(shares)
+            # last resort: average allowed amount
+            return self.get_average_allowed_amount(cpt)
+    
+        total_patient_share = 0.0
+    
+        for cpt in cpt_codes:
+            # If we have a mapped payer, try that first
+            if payer_code:
+                a = self.allowed_amounts.get(payer_code, {}).get(cpt)
+                b = self.paid_amounts.get(payer_code, {}).get(cpt) if hasattr(self, 'paid_amounts') else None
+    
+                if a is not None and b is not None:
+                    total_patient_share += max(0.0, a - b)
+                    continue
+                if a is not None and b is None:
+                    total_patient_share += a
+                    continue
+    
+            # Fallbacks when payer not mapped for this CPT, or values missing
+            total_patient_share += avg_patient_share_for_cpt(cpt)
+    
+        return round(total_patient_share, 2)
+
+
     
     def calculate_service_line_responsibility(self, insurance: Dict, pverify_data: Dict, service_line: str) -> str:
         """Calculate patient responsibility for a specific service line."""
