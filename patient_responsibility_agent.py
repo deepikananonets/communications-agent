@@ -1117,9 +1117,9 @@ class PatientResponsibilityAgent:
     def _init_service_line_mappings(self):
         """Initialize service line to CPT code mappings."""
         self.service_line_cpt_mapping = {
-            'KAP': ['90791', '90837', '96130', '96130-59'],
-            'Spravato': ['G2082', 'G2083', 'S0013-84'],
-            'Med Management (Psych E/M)': ['99204', '99204-25', '99205-25', '99205-95', '99214', '99215', '99215-25', '99417', 'G2212'],
+            'KAP': ['90791', '90837', '96130'],
+            'Spravato': ['G2083'],
+            'Med Management (Psych E/M)': ['99204', '99205', '99215', '99417'],
             'IM ketamine': ['96372', '96372-59', 'J3490', 'J3490-GA']
         }
     
