@@ -1490,6 +1490,20 @@ class PatientResponsibilityAgent:
         has_non_zero_dollar = False
         has_zero_dollar = False
         has_other_values = False
+
+        name_upper = (insurance.get('carname') or '').upper()
+
+        # 🚫 Skip Medicaid & RAEs — no PR to post
+        if any(tag in name_upper for tag in [
+            'MEDICAID',
+            'HEALTH FIRST MEDICAID',
+            'CO ACCESS',
+            'COLORADO ACCESS',
+            'CCHA',
+            'COLORADO COMMUNITY HEALTH ALLIANCE'
+        ]):
+            logger.debug(f"Skipping memo: Medicaid/RAE plan [{name_upper}] — no PR to post")
+            return False
         
         for service_line in service_lines:
             # Get the formatted responsibility text (what appears in memo)
