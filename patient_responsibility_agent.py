@@ -46,7 +46,7 @@ def memo_already_logged(patient_name: str, insurance_name: str, memo_text: str, 
     """
     # Patterns that match how we currently log messages
     success_msg = f"Patient: {patient_name} | Memo: {memo_text}"
-    skipped_msg = f"SKIPPED by posting rules. Patient: {patient_name} | Insurance: {insurance_name} | Memo preview: {memo_text}"
+    skipped_msg = f"Skipped due to posting rules. Patient: {patient_name} | Insurance: {insurance_name} | Memo preview: {memo_text}"
 
     sql = """
         SELECT 1
