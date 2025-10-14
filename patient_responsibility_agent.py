@@ -25,6 +25,7 @@ import contextlib
 import psycopg2
 import psycopg2.extras
 from sshtunnel import SSHTunnelForwarder
+from zoneinfo import ZoneInfo
 import config
 
 # Configure logging
@@ -319,6 +320,116 @@ class AdvancedMDAPI:
         except Exception as e:
             logger.error(f"Error checking appointments for patient {patient_id}: {e}")
             return False
+    
+    def get_appointment_dates(self, patient_id: str) -> List[datetime]:
+        """Get list of appointment dates for a patient."""
+        if not self.token:
+            return []
+            
+        payload = {
+            "ppmdmsg": {
+                "@action": "getpatientvisits",
+                "@patientid": patient_id,
+                "@class": "api",
+                "@nocookie": "0",
+                "visit": {
+                    "@color": "Color",
+                    "@duration": "Duration",
+                    "@refreason": "RefReason",
+                    "@apptstatus": "ApptStatus",
+                    "@ByRefProvMiddleName": "ByRefProvMiddleName",
+                    "@ByRefProvFirstName": "ByRefProvFirstName",
+                    "@ByRefProvLastName": "ByRefProvLastName",
+                    "@ByReferringProviderFID": "ByReferringProviderFID",
+                    "@columnheading": "ColumnHeading",
+                    "@AppointmentType": "AppointmentType",
+                    "@AppointmentTypeID": "AppointmentTypeID",
+                    "@Visitstartdatetime": "VisitStartDateTime"
+                },
+                "patient": {
+                    "@createdat": "CreatedAt",
+                    "@changedat": "ChangedAt",
+                    "@ssn": "SSN",
+                    "@name": "Name"
+                },
+                "insurance": {
+                    "@createdat": "CreatedAt",
+                    "@changedat": "ChangedAt",
+                    "@carcode": "CarCode",
+                    "@carname": "CarName"
+                }
+            }
+        }
+            
+        try:
+            response = requests.post(
+                self.base_url,
+                headers={
+                    'Cookie': f'token={self.token}',
+                    'Content-Type': 'application/json'
+                },
+                json=payload
+            )
+            response.raise_for_status()
+            
+            # Parse XML response
+            root = ET.fromstring(response.text)
+            appointment_dates = []
+            
+            for visit_elem in root.findall('.//visit'):
+                visit_datetime_str = visit_elem.get('visitstartdatetime')
+                if visit_datetime_str:
+                    try:
+                        # Parse ISO format: "2024-02-12T12:45:00"
+                        visit_datetime = datetime.fromisoformat(visit_datetime_str)
+                        appointment_dates.append(visit_datetime)
+                    except ValueError as e:
+                        logger.warning(f"Could not parse appointment datetime '{visit_datetime_str}': {e}")
+                        continue
+            
+            logger.debug(f"Found {len(appointment_dates)} appointments for patient {patient_id}")
+            return appointment_dates
+                
+        except Exception as e:
+            logger.error(f"Error getting appointment dates for patient {patient_id}: {e}")
+            return []
+    
+    def should_process_patient_by_appointments(self, patient_id: str) -> bool:
+        """Check if patient should be processed based on appointment dates.
+        
+        Returns True if:
+        - Patient has no appointments, OR
+        - Patient has at least one appointment tomorrow (Denver time)
+        """
+        appointment_dates = self.get_appointment_dates(patient_id)
+        
+        # If no appointments, include patient
+        if not appointment_dates:
+            logger.debug(f"Patient {patient_id} has no appointments - including")
+            return True
+        
+        # Get tomorrow's date in Denver timezone
+        denver_tz = ZoneInfo('America/Denver')
+        now_denver = datetime.now(denver_tz)
+        tomorrow_denver = (now_denver + timedelta(days=1)).date()
+        
+        logger.debug(f"Checking appointments for patient {patient_id}. Today in Denver: {now_denver.date()}, Tomorrow: {tomorrow_denver}")
+        
+        # Check if any appointment is tomorrow
+        for appt_datetime in appointment_dates:
+            # Assume the datetime from API is in Denver time (no timezone info)
+            # Convert to Denver timezone-aware datetime
+            appt_datetime_denver = appt_datetime.replace(tzinfo=denver_tz)
+            appt_date = appt_datetime_denver.date()
+            
+            logger.debug(f"  Appointment on: {appt_date} at {appt_datetime_denver.time()}")
+            
+            if appt_date == tomorrow_denver:
+                logger.debug(f"Patient {patient_id} has appointment tomorrow ({tomorrow_denver}) - including")
+                return True
+        
+        logger.debug(f"Patient {patient_id} has appointments but none tomorrow - excluding")
+        return False
     
     def submit_eligibility_check(self, patient_id: str, insurance_coverage_id: str) -> Optional[str]:
         """Submit eligibility check request."""
@@ -1706,16 +1817,17 @@ class PatientResponsibilityAgent:
             logger.warning("No patients found")
             return
         
-        # Step 3: Filter patients WITHOUT appointments
-        logger.info("Filtering patients without appointments...")
-        patients_without_appointments = []
+        # Step 3: Filter patients by appointment criteria
+        # Include patients with NO appointments OR patients with appointments TOMORROW (Denver time)
+        logger.info("Filtering patients by appointment criteria (no appointments or appointments tomorrow)...")
+        patients_to_process = []
         
         for patient in patients:
-            if not self.amd_api.has_appointments(patient['id']):
-                patients_without_appointments.append(patient)
+            if self.amd_api.should_process_patient_by_appointments(patient['id']):
+                patients_to_process.append(patient)
         
-        logger.info(f"Found {len(patients_without_appointments)} patients without appointments")
-        self.final_patients = patients_without_appointments
+        logger.info(f"Found {len(patients_to_process)} patients matching appointment criteria")
+        self.final_patients = patients_to_process
         
         # Step 4: Process each patient
         for patient in self.final_patients:
