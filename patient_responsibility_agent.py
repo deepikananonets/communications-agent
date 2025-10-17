@@ -1525,6 +1525,7 @@ class PatientResponsibilityAgent:
         Rules:
         - Medicaid: $0 for ALL service lines (no PR).
         - Self-Pay: IM=$399, Spravato=$949 (overrides). Others fall through.
+        - MedMan (Med Management): Can never exceed IM ketamine PR; use office visit copay as reference
         - Otherwise, for each CPT in the service line:
             * If both Allowed and Paid exist for payer: use max(Allowed - Paid, 0).
             * If Allowed exists but Paid missing: use Allowed.
@@ -1585,7 +1586,37 @@ class PatientResponsibilityAgent:
             # Fallbacks when payer not mapped for this CPT, or values missing
             total_patient_share += avg_patient_share_for_cpt(cpt)
     
-        return round(total_patient_share, 2)
+        calculated_pr = round(total_patient_share, 2)
+        
+        # Special handling for Med Management: refer to office visit copay and can never be more than IM ketamine PR
+        if service_line == 'Med Management (Psych E/M)':
+            # Calculate IM ketamine PR for comparison
+            im_pr = self.calculate_service_line_responsibility_enhanced(insurance, pverify_data, 'IM ketamine')
+            
+            # Get office visit copay from insurance data or PVerify (primary reference for MedMan)
+            office_copay = 0.0
+            
+            # First try to get from PVerify data (more reliable)
+            if pverify_data:
+                financial_data = pverify_data.get('financial_data', {})
+                if financial_data and financial_data.get('copay', 0) > 0:
+                    office_copay = float(financial_data.get('copay', 0))
+            
+            # Fallback to insurance data
+            if office_copay == 0.0 and insurance.get('copaydollaramount', 0) > 0:
+                office_copay = float(insurance.get('copaydollaramount', 0))
+            
+            # Use office copay as the primary value for MedMan if available
+            if office_copay > 0:
+                calculated_pr = office_copay
+                logger.debug(f"Med Management PR using office visit copay: ${calculated_pr:.2f}")
+            
+            # Cap MedMan PR at IM PR (MedMan can never exceed IM)
+            if im_pr > 0:
+                calculated_pr = min(calculated_pr, im_pr)
+                logger.debug(f"Med Management PR after IM cap: ${calculated_pr:.2f} (IM PR: ${im_pr:.2f})")
+        
+        return calculated_pr
 
 
     
