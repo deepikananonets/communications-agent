@@ -815,9 +815,36 @@ class PVerifyAPI:
             logger.warning(f"No member ID found for {patient.get('name')} - {insurance.get('carname')}")
             return {}
         
-        # Default payer code if not found
+        # Map insurance name to payer code if not found from discovery
         if not payer_code:
-            payer_code = "00192"  # Generic code
+            insurance_name = insurance.get('carname', '').upper()
+            
+            # Map common payer names to their PVerify payer codes
+            if 'CIGNA' in insurance_name:
+                payer_code = "00004"  # Cigna
+            elif 'UNITED' in insurance_name or 'UHC' in insurance_name or 'UNITEDHEALTHCARE' in insurance_name:
+                payer_code = "00192"  # United Healthcare
+            elif 'AETNA' in insurance_name:
+                payer_code = "00001"  # Aetna
+            elif 'BLUE CROSS' in insurance_name or 'BCBS' in insurance_name or 'BLUE SHIELD' in insurance_name:
+                if 'TEXAS' in insurance_name or 'TBS' in insurance_name:
+                    payer_code = "00220"  # Blue Cross Blue Shield of Texas
+                elif 'COLORADO' in insurance_name:
+                    payer_code = "00210"  # Blue Cross Blue Shield of Colorado
+                elif 'ANTHEM' in insurance_name:
+                    payer_code = "00210"  # Anthem BCBS
+                else:
+                    payer_code = "00210"  # Blue Cross Blue Shield
+            elif 'HUMANA' in insurance_name:
+                payer_code = "00112"  # Humana
+            elif 'MEDICARE' in insurance_name:
+                payer_code = "00007"  # Medicare
+            elif 'MEDICAID' in insurance_name:
+                payer_code = "00071"  # Medicaid
+            else:
+                payer_code = "00192"  # Default to United Healthcare as fallback
+        
+        logger.debug(f"Using payer code: {payer_code} for insurance: {insurance.get('carname')}")
         
         payload = {
             "payerCode": payer_code,
@@ -1588,33 +1615,43 @@ class PatientResponsibilityAgent:
     
         calculated_pr = round(total_patient_share, 2)
         
-        # Special handling for Med Management: refer to office visit copay and can never be more than IM ketamine PR
-        if service_line == 'Med Management (Psych E/M)':
-            # Calculate IM ketamine PR for comparison
+        # Check if we have a definite copay from PVerify
+        pverify_copay = 0.0
+        if pverify_data:
+            financial_data = pverify_data.get('financial_data', {})
+            pverify_copay = financial_data.get('copay', 0)
+        
+        # Apply service line logic
+        if service_line == 'IM ketamine':
+            # For IM: use PVerify copay if available and non-zero, otherwise use table calculation
+            if pverify_copay > 0:
+                calculated_pr = float(pverify_copay)
+                logger.debug(f"IM ketamine PR using PVerify copay: ${calculated_pr:.2f}")
+            else:
+                # Use table calculation (already in calculated_pr)
+                logger.debug(f"IM ketamine PR using table calculation: ${calculated_pr:.2f}")
+        
+        elif service_line == 'Med Management (Psych E/M)':
+            # For MedMan: use PVerify copay if available, otherwise use table calculation
+            if pverify_copay > 0:
+                med_man_pr = float(pverify_copay)
+            else:
+                # Use table calculation
+                med_man_pr = calculated_pr
+            
+            # MedMan can never exceed IM PR - get IM PR first for comparison
             im_pr = self.calculate_service_line_responsibility_enhanced(insurance, pverify_data, 'IM ketamine')
             
-            # Get office visit copay from insurance data or PVerify (primary reference for MedMan)
-            office_copay = 0.0
-            
-            # First try to get from PVerify data (more reliable)
-            if pverify_data:
-                financial_data = pverify_data.get('financial_data', {})
-                if financial_data and financial_data.get('copay', 0) > 0:
-                    office_copay = float(financial_data.get('copay', 0))
-            
-            # Fallback to insurance data
-            if office_copay == 0.0 and insurance.get('copaydollaramount', 0) > 0:
-                office_copay = float(insurance.get('copaydollaramount', 0))
-            
-            # Use office copay as the primary value for MedMan if available
-            if office_copay > 0:
-                calculated_pr = office_copay
-                logger.debug(f"Med Management PR using office visit copay: ${calculated_pr:.2f}")
-            
-            # Cap MedMan PR at IM PR (MedMan can never exceed IM)
-            if im_pr > 0:
-                calculated_pr = min(calculated_pr, im_pr)
-                logger.debug(f"Med Management PR after IM cap: ${calculated_pr:.2f} (IM PR: ${im_pr:.2f})")
+            # Cap MedMan at IM PR if IM PR is available and non-zero
+            if im_pr > 0 and med_man_pr > im_pr:
+                calculated_pr = im_pr
+                logger.debug(f"Med Management PR capped at IM PR: ${calculated_pr:.2f} (would be ${med_man_pr:.2f}, IM PR: ${im_pr:.2f})")
+            else:
+                calculated_pr = med_man_pr
+                if pverify_copay > 0:
+                    logger.debug(f"Med Management PR using PVerify copay: ${calculated_pr:.2f}")
+                else:
+                    logger.debug(f"Med Management PR using table calculation: ${calculated_pr:.2f}")
         
         return calculated_pr
 
@@ -1679,16 +1716,17 @@ class PatientResponsibilityAgent:
 
         name_upper = (insurance.get('carname') or '').upper()
 
-        # 🚫 Skip Medicaid & RAEs — no PR to post
+        # 🚫 Skip Medicaid, Medicare & RAEs — no PR to post
         if any(tag in name_upper for tag in [
             'MEDICAID',
             'HEALTH FIRST MEDICAID',
+            'MEDICARE',
             'CO ACCESS',
             'COLORADO ACCESS',
             'CCHA',
             'COLORADO COMMUNITY HEALTH ALLIANCE'
         ]):
-            logger.debug(f"Skipping memo: Medicaid/RAE plan [{name_upper}] — no PR to post")
+            logger.debug(f"Skipping memo: Medicaid/Medicare/RAE plan [{name_upper}] — no PR to post")
             return False
         
         for service_line in service_lines:
@@ -1865,7 +1903,29 @@ class PatientResponsibilityAgent:
             logger.info(f"Processing patient: {patient['name']} (ID: {patient['id']})")
             
             try:
-                # Step 4a: Run PVerify eligibility check for each active insurance
+                # Step 4a: Check if ANY active insurance is Medicaid/Medicare/RAE - skip patient entirely if so
+                has_medicaid_medicare = False
+                for insurance_check in patient['insurances']:
+                    if insurance_check['active']:
+                        name_upper = (insurance_check.get('carname') or '').upper()
+                        if any(tag in name_upper for tag in [
+                            'MEDICAID',
+                            'HEALTH FIRST MEDICAID',
+                            'MEDICARE',
+                            'CO ACCESS',
+                            'COLORADO ACCESS',
+                            'CCHA',
+                            'COLORADO COMMUNITY HEALTH ALLIANCE'
+                        ]):
+                            has_medicaid_medicare = True
+                            logger.info(f"Skipping patient {patient['name']} entirely - has Medicaid/Medicare/RAE insurance: {insurance_check.get('carname')}")
+                            break
+                
+                if has_medicaid_medicare:
+                    # Skip this patient entirely - don't run PVerify or post any memos
+                    continue
+                
+                # Step 4b: Run PVerify eligibility check for each active insurance
                 pverify_results = {}
                 for insurance in patient['insurances']:
                     if insurance['active']:
@@ -1885,7 +1945,7 @@ class PatientResponsibilityAgent:
                         else:
                             logger.warning(f"No PVerify data for {patient['name']} - {insurance.get('carname')}")
                 
-                # Step 4b: Generate and post comprehensive memo for each active insurance
+                # Step 4c: Generate and post comprehensive memo for each active insurance
                 for insurance in patient['insurances']:
                     if insurance['active']:
                         # Get PVerify data for this insurance
