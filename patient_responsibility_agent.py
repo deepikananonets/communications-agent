@@ -520,16 +520,21 @@ class AdvancedMDAPI:
         if not self.token:
             return False
             
+        created_datetime = datetime.now()
+        msgtime_str = created_datetime.strftime("%m/%d/%Y %I:%M:%S %p")
+        created_date_str = created_datetime.strftime("%m/%d/%Y")
+        expire_date_str = (created_datetime + timedelta(days=3)).strftime("%m/%d/%Y")
+
         payload = {
             "ppmdmsg": {
                 "@action": "savememo",
                 "@class": "demographics",
-                "@msgtime": datetime.now().strftime("%m/%d/%Y %I:%M:%S %p"),
+                "@msgtime": msgtime_str,
                 "@patientfid": patient_id,
-                "@created": datetime.now().strftime("%m/%d/%Y"),
+                "@created": created_date_str,
                 "@case_memotext": memo_text,
                 "@memotype": "d",
-                "@expiredate": ""
+                "@expiredate": expire_date_str
             }
         }
         
@@ -1617,23 +1622,31 @@ class PatientResponsibilityAgent:
         
         # Check if we have a definite copay from PVerify
         pverify_copay = 0.0
+        pverify_status = None
         if pverify_data:
             financial_data = pverify_data.get('financial_data', {})
             pverify_copay = financial_data.get('copay', 0)
+            # Get eligibility status to determine if $0 copay is valid
+            eligibility_data = pverify_data.get('eligibility_data', {})
+            pverify_status = eligibility_data.get('status', '').strip().upper() if eligibility_data else None
+        
+        # Determine if we should use PVerify copay
+        # Use PVerify copay if: (1) copay > 0, OR (2) status is Active and copay is 0 (meaning $0 is valid)
+        use_pverify_copay = pverify_copay > 0 or (pverify_status == 'ACTIVE' and pverify_copay == 0)
         
         # Apply service line logic
         if service_line == 'IM ketamine':
-            # For IM: use PVerify copay if available and non-zero, otherwise use table calculation
-            if pverify_copay > 0:
+            # For IM: use PVerify copay if valid, otherwise use table calculation
+            if use_pverify_copay:
                 calculated_pr = float(pverify_copay)
-                logger.debug(f"IM ketamine PR using PVerify copay: ${calculated_pr:.2f}")
+                logger.debug(f"IM ketamine PR using PVerify copay: ${calculated_pr:.2f} (status: {pverify_status})")
             else:
                 # Use table calculation (already in calculated_pr)
                 logger.debug(f"IM ketamine PR using table calculation: ${calculated_pr:.2f}")
         
         elif service_line == 'Med Management (Psych E/M)':
-            # For MedMan: use PVerify copay if available, otherwise use table calculation
-            if pverify_copay > 0:
+            # For MedMan: use PVerify copay if valid, otherwise use table calculation
+            if use_pverify_copay:
                 med_man_pr = float(pverify_copay)
             else:
                 # Use table calculation
@@ -1648,8 +1661,8 @@ class PatientResponsibilityAgent:
                 logger.debug(f"Med Management PR capped at IM PR: ${calculated_pr:.2f} (would be ${med_man_pr:.2f}, IM PR: ${im_pr:.2f})")
             else:
                 calculated_pr = med_man_pr
-                if pverify_copay > 0:
-                    logger.debug(f"Med Management PR using PVerify copay: ${calculated_pr:.2f}")
+                if use_pverify_copay:
+                    logger.debug(f"Med Management PR using PVerify copay: ${calculated_pr:.2f} (status: {pverify_status})")
                 else:
                     logger.debug(f"Med Management PR using table calculation: ${calculated_pr:.2f}")
         
@@ -1661,6 +1674,12 @@ class PatientResponsibilityAgent:
         """Calculate patient responsibility for a specific service line."""
         # Use enhanced calculation to get dollar amount
         enhanced_amount = self.calculate_service_line_responsibility_enhanced(insurance, pverify_data, service_line)
+        
+        # Check if PVerify status is Active (to determine if $0 is valid)
+        pverify_status = None
+        if pverify_data:
+            eligibility_data = pverify_data.get('eligibility_data', {})
+            pverify_status = eligibility_data.get('status', '').strip().upper() if eligibility_data else None
         
         payer_type = self.get_payer_type(insurance)
         
@@ -1695,7 +1714,10 @@ class PatientResponsibilityAgent:
                     return f'${enhanced_amount:.2f} patient responsibility'
         
         # For all other cases, return calculated dollar amount or fallback text
-        if enhanced_amount > 0:
+        # If status is Active and amount is 0, return $0.00 (valid $0 copay from PVerify)
+        if pverify_status == 'ACTIVE' and enhanced_amount == 0.0:
+            return '$0.00 patient responsibility'
+        elif enhanced_amount > 0:
             return f'${enhanced_amount:.2f} patient responsibility'
         else:
             return 'Copay/coinsurance/deductible per eligibility'
@@ -1704,15 +1726,24 @@ class PatientResponsibilityAgent:
         """
         Determine if memo should be posted based on filtering rules:
         - Do NOT post if memo has no dollar amounts and only "Per Elig" everywhere
-        - Do NOT post if memo has a mix of "Per Elig" and $0 amounts
+        - Do NOT post if memo has a mix of "Per Elig" and $0 amounts (from table fallback)
         - DO post if memo has AT LEAST one non-zero dollar amount, OR no "Per Elig" at all
+        - DO post if memo has $0.00 from PVerify with Active status (valid definite amounts)
         """
         service_lines = ['IM ketamine', 'KAP', 'Spravato', 'Med Management (Psych E/M)']
         
         has_per_elig = False
         has_non_zero_dollar = False
         has_zero_dollar = False
+        has_valid_zero = False  # $0.00 from PVerify with Active status
         has_other_values = False
+
+        # Check if PVerify status is Active (to validate $0 copays)
+        pverify_status = None
+        if pverify_data:
+            eligibility_data = pverify_data.get('eligibility_data', {})
+            pverify_status = eligibility_data.get('status', '').strip().upper() if eligibility_data else None
+        is_active = pverify_status == 'ACTIVE'
 
         name_upper = (insurance.get('carname') or '').upper()
 
@@ -1738,7 +1769,11 @@ class PatientResponsibilityAgent:
             if resp_abbrev == 'Per Elig':
                 has_per_elig = True
             elif resp_abbrev == '$0' or resp_abbrev == '$0.00':
-                has_zero_dollar = True
+                # Check if this $0 is from PVerify with Active status (valid definite amount)
+                if is_active and responsibility == '$0.00 patient responsibility':
+                    has_valid_zero = True
+                else:
+                    has_zero_dollar = True
             elif resp_abbrev.startswith('$') and resp_abbrev not in ['$0', '$0.00']:
                 # Extract dollar amount to check if non-zero
                 import re
@@ -1755,18 +1790,24 @@ class PatientResponsibilityAgent:
         # Apply filtering rules:
         
         # Rule 1: Do NOT post if only "Per Elig" everywhere
-        if has_per_elig and not has_non_zero_dollar and not has_zero_dollar and not has_other_values:
+        if has_per_elig and not has_non_zero_dollar and not has_zero_dollar and not has_other_values and not has_valid_zero:
             logger.debug(f"Filtering out memo: only 'Per Elig' values found")
             return False
         
         # Rule 2: Do NOT post if mix of "Per Elig" and $0 amounts (no positive amounts or other values)
-        if has_per_elig and has_zero_dollar and not has_non_zero_dollar and not has_other_values:
+        # UNLESS the $0 amounts are valid from PVerify Active status
+        if has_per_elig and has_zero_dollar and not has_non_zero_dollar and not has_other_values and not has_valid_zero:
             logger.debug(f"Filtering out memo: mix of 'Per Elig' and $0 amounts only")
             return False
         
         # Rule 3: DO post if AT LEAST one non-zero dollar amount
         if has_non_zero_dollar:
             logger.debug(f"Posting memo: has non-zero dollar amount")
+            return True
+        
+        # Rule 3b: DO post if we have valid $0.00 from PVerify (definite amounts)
+        if has_valid_zero:
+            logger.debug(f"Posting memo: has valid $0.00 from PVerify with Active status")
             return True
         
         # Rule 4: DO post if no "Per Elig" at all (even if all $0 or other values)
