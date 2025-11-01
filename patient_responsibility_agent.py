@@ -1628,7 +1628,8 @@ class PatientResponsibilityAgent:
             pverify_copay = financial_data.get('copay', 0)
             # Get eligibility status to determine if $0 copay is valid
             eligibility_data = pverify_data.get('eligibility_data', {})
-            pverify_status = eligibility_data.get('status', '').strip().upper() if eligibility_data else None
+            status_raw = eligibility_data.get('status') if eligibility_data else None
+            pverify_status = status_raw.strip().upper() if isinstance(status_raw, str) and status_raw else None
         
         # Determine if we should use PVerify copay
         # Use PVerify copay if: (1) copay > 0, OR (2) status is Active and copay is 0 (meaning $0 is valid)
@@ -1679,7 +1680,8 @@ class PatientResponsibilityAgent:
         pverify_status = None
         if pverify_data:
             eligibility_data = pverify_data.get('eligibility_data', {})
-            pverify_status = eligibility_data.get('status', '').strip().upper() if eligibility_data else None
+            status_raw = eligibility_data.get('status') if eligibility_data else None
+            pverify_status = status_raw.strip().upper() if isinstance(status_raw, str) and status_raw else None
         
         payer_type = self.get_payer_type(insurance)
         
@@ -1742,7 +1744,8 @@ class PatientResponsibilityAgent:
         pverify_status = None
         if pverify_data:
             eligibility_data = pverify_data.get('eligibility_data', {})
-            pverify_status = eligibility_data.get('status', '').strip().upper() if eligibility_data else None
+            status_raw = eligibility_data.get('status') if eligibility_data else None
+            pverify_status = status_raw.strip().upper() if isinstance(status_raw, str) and status_raw else None
         is_active = pverify_status == 'ACTIVE'
 
         name_upper = (insurance.get('carname') or '').upper()
