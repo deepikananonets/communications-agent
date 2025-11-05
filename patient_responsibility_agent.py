@@ -1147,8 +1147,8 @@ def log_agent_run_success(patient_memo: str, started_at_utc: datetime, ended_at_
     sql = """
         INSERT INTO agent_run_logs 
           (agent_id, service_request_id, documents_processed, status,
-           output_data, start_time, end_time, call_id, vapi_listen_url,
-           vapi_control_url, manual_trigger)
+           output_data, start_time, end_time, call_id, listen_url,
+           control_url, manual_trigger)
         VALUES
           (%s::uuid, NULL::int, %s::int, %s, %s, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
     """
@@ -1181,8 +1181,8 @@ def log_agent_run_skipped(reason: str, started_at_utc: datetime, ended_at_utc: d
     sql = """
         INSERT INTO agent_run_logs 
           (agent_id, service_request_id, documents_processed, status,
-           output_data, start_time, end_time, call_id, vapi_listen_url,
-           vapi_control_url, manual_trigger)
+           output_data, start_time, end_time, call_id, listen_url,
+           control_url, manual_trigger)
         VALUES
           (%s::uuid, NULL::int, %s::int, %s, %s, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
     """
@@ -1216,8 +1216,8 @@ def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_u
     sql = """
         INSERT INTO agent_run_logs 
           (agent_id, service_request_id, documents_processed, status,
-           output_data, start_time, end_time, call_id, vapi_listen_url,
-           vapi_control_url, manual_trigger)
+           output_data, start_time, end_time, call_id, listen_url,
+           control_url, manual_trigger)
         VALUES
           (%s::uuid, NULL::int, %s::int, %s, %s, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
     """
