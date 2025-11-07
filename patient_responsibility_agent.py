@@ -913,7 +913,9 @@ class PVerifyAPI:
             'deductible': 0.0,
             'deductible_remaining': 0.0,
             'annual_deductible': 0.0,
-            'deductible_met': 0.0
+            'deductible_met': 0.0,
+            'copay_found': False,
+            'coinsurance_found': False
         }
         
         # Check if eligibility status is inactive or null - return default values
@@ -945,11 +947,13 @@ class PVerifyAPI:
                                     value = value.strip() if value else ''
                                     
                                     if 'co-pay' in key and value:
+                                        financial_data['copay_found'] = True
                                         try:
                                             financial_data['copay'] = float(value.replace('$', '').replace(',', ''))
                                         except ValueError:
                                             pass
                                     elif 'co-ins' in key and value:
+                                        financial_data['coinsurance_found'] = True
                                         try:
                                             financial_data['coinsurance'] = float(value.replace('%', ''))
                                         except ValueError:
@@ -981,6 +985,7 @@ class PVerifyAPI:
                                                         value = value.strip() if value else ''
                                                         
                                                         if 'co-payment' in key and value and '$' in value:
+                                                            financial_data['copay_found'] = True
                                                             try:
                                                                 copay_val = float(value.replace('$', '').replace(',', ''))
                                                                 if copay_val > financial_data['copay']:
@@ -988,6 +993,7 @@ class PVerifyAPI:
                                                             except ValueError:
                                                                 pass
                                                         elif 'co-insurance' in key and value and '%' in value:
+                                                            financial_data['coinsurance_found'] = True
                                                             try:
                                                                 coins_val = float(value.replace('%', ''))
                                                                 if coins_val > financial_data['coinsurance']:
@@ -1256,6 +1262,8 @@ class PatientResponsibilityAgent:
         self._init_payer_mappings()
         self._init_allowed_amounts()
         self._init_paid_amounts()
+        self._init_cpt_fees()
+        self._init_coinsurance_fee_mappings()
     
     def _init_service_line_mappings(self):
         """Initialize service line to CPT code mappings."""
@@ -1381,6 +1389,108 @@ class PatientResponsibilityAgent:
 
     
     
+    def _init_cpt_fees(self):
+        """Initialize CPT fee schedule for coinsurance calculations."""
+        self.cpt_fees = {
+            '99214': 200.0,
+            '99215': 349.0,
+            '99213': 100.0,
+            'J3490': 70.0,
+            'S0013 84': 1680.0,
+            'S0013 56': 1120.0,
+            '96372': 30.0,
+            '96130': 150.0,
+            '99417': 320.0,
+            '90791': 175.0,
+            '90837': 160.0,
+            '90833': 80.0,
+            '90834': 149.0,
+            '90836': 99.0,
+            '90853': 45.0
+        }
+
+    def _init_coinsurance_fee_mappings(self):
+        """Initialize CPT mappings used for coinsurance-based calculations."""
+        self.coinsurance_fee_map = {
+            'IM ketamine': ['99215', 'J3490', '99417', '96372'],
+            'Med Management (Psych E/M)': ['99214', 'J3490', '96372']
+        }
+
+    def _sum_cpt_fees(self, cpt_codes: List[str]) -> float:
+        """Sum fee schedule amounts for the provided CPT codes."""
+        total = 0.0
+        missing_codes = []
+        for code in cpt_codes:
+            fee = self.cpt_fees.get(code)
+            if fee is None:
+                missing_codes.append(code)
+                continue
+            total += fee
+
+        if missing_codes:
+            logger.debug(f"No fee configured for CPT codes {missing_codes} during coinsurance calculation")
+
+        return total
+
+    def _get_coinsurance_rate(self, insurance: Dict, pverify_data: Dict) -> Optional[float]:
+        """Return coinsurance rate as a decimal if override conditions are met."""
+        if self.get_payer_type(insurance) == 'Medicaid':
+            return None
+
+        if not pverify_data:
+            return None
+
+        financial_data = pverify_data.get('financial_data') or {}
+        if not financial_data.get('coinsurance_found'):
+            return None
+
+        coinsurance_percent = float(financial_data.get('coinsurance', 0) or 0)
+        if coinsurance_percent <= 0:
+            return None
+
+        # Only apply override when no copay information is present
+        if financial_data.get('copay_found'):
+            return None
+
+        return coinsurance_percent / 100.0
+
+    def _evaluate_coinsurance_override(self, insurance: Dict, pverify_data: Dict, service_line: str) -> Dict[str, Optional[float]]:
+        """Determine if the coinsurance override applies for the given service line."""
+        result = {
+            'applies': False,
+            'amount': None,
+            'force_per_elig': False,
+            'rate': None
+        }
+
+        rate = self._get_coinsurance_rate(insurance, pverify_data)
+        if rate is None:
+            return result
+
+        result['rate'] = rate
+
+        if service_line == 'IM ketamine':
+            total_fee = self._sum_cpt_fees(self.coinsurance_fee_map.get('IM ketamine', []))
+            if total_fee > 0:
+                result['applies'] = True
+                result['amount'] = round(rate * total_fee, 2)
+            return result
+
+        if service_line == 'Med Management (Psych E/M)':
+            total_fee = self._sum_cpt_fees(self.coinsurance_fee_map.get('Med Management (Psych E/M)', []))
+            if total_fee > 0:
+                result['applies'] = True
+                result['amount'] = round(rate * total_fee, 2)
+            return result
+
+        if service_line in ('KAP', 'Spravato'):
+            result['applies'] = True
+            result['force_per_elig'] = True
+            return result
+
+        return result
+
+
     
     def get_payer_code(self, insurance_name: str) -> Optional[str]:
         """Map insurance name to payer code for allowed amounts lookup."""
@@ -1578,6 +1688,28 @@ class PatientResponsibilityAgent:
             if service_line == 'Spravato':
                 return 949.0
             # For other self-pay lines, fall through to table-based estimate (rare)
+
+        override = self._evaluate_coinsurance_override(insurance, pverify_data, service_line)
+        if override['applies']:
+            if override['force_per_elig']:
+                logger.debug(
+                    f"Coinsurance override forcing 'Per Elig' for {service_line} (coinsurance={override['rate'] * 100 if override['rate'] is not None else 'N/A'}%)"
+                )
+                return 0.0
+
+            amount = override['amount'] if override['amount'] is not None else 0.0
+            if service_line == 'Med Management (Psych E/M)':
+                im_pr = self.calculate_service_line_responsibility_enhanced(insurance, pverify_data, 'IM ketamine')
+                if im_pr > 0 and amount > im_pr:
+                    amount = im_pr
+
+            if override['rate'] is not None:
+                logger.debug(
+                    f"Coinsurance override applied for {service_line}: {override['rate'] * 100:.2f}% of fee schedule = ${amount:.2f}"
+                )
+            else:
+                logger.debug(f"Coinsurance override applied for {service_line}: ${amount:.2f}")
+            return amount
     
         # Get CPTs for this service line
         cpt_codes = self.service_line_cpt_mapping.get(service_line, [])
@@ -1715,6 +1847,12 @@ class PatientResponsibilityAgent:
                 else:
                     return f'${enhanced_amount:.2f} patient responsibility'
         
+        override = self._evaluate_coinsurance_override(insurance, pverify_data, service_line)
+        if override['applies']:
+            if override['force_per_elig']:
+                return 'Copay/coinsurance/deductible per eligibility'
+            return f'${enhanced_amount:.2f} patient responsibility'
+
         # For all other cases, return calculated dollar amount or fallback text
         # If status is Active and amount is 0, return $0.00 (valid $0 copay from PVerify)
         if pverify_status == 'ACTIVE' and enhanced_amount == 0.0:
