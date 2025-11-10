@@ -1264,6 +1264,7 @@ class PatientResponsibilityAgent:
         self._init_paid_amounts()
         self._init_cpt_fees()
         self._init_coinsurance_fee_mappings()
+        self.default_coinsurance_rate = float(getattr(config, 'DEFAULT_COINSURANCE_RATE', 0.0) or 0.0)
     
     def _init_service_line_mappings(self):
         """Initialize service line to CPT code mappings."""
@@ -1454,20 +1455,49 @@ class PatientResponsibilityAgent:
 
         return coinsurance_percent / 100.0
 
+    def _should_apply_default_coinsurance(self, insurance: Dict, pverify_data: Dict, service_line: str) -> bool:
+        """Determine whether to fall back to the default coinsurance rate."""
+        if self.default_coinsurance_rate <= 0:
+            return False
+
+        if service_line not in self.coinsurance_fee_map:
+            return False
+
+        payer_type = self.get_payer_type(insurance)
+        if payer_type in ('Medicaid', 'Self-Pay'):
+            return False
+
+        if pverify_data:
+            financial_data = pverify_data.get('financial_data') or {}
+            if financial_data.get('copay_found'):
+                return False
+            if financial_data.get('coinsurance_found'):
+                return False
+
+        return True
+
     def _evaluate_coinsurance_override(self, insurance: Dict, pverify_data: Dict, service_line: str) -> Dict[str, Optional[float]]:
         """Determine if the coinsurance override applies for the given service line."""
         result = {
             'applies': False,
             'amount': None,
             'force_per_elig': False,
-            'rate': None
+            'rate': None,
+            'used_default_rate': False
         }
 
         rate = self._get_coinsurance_rate(insurance, pverify_data)
+        using_default_rate = False
+
         if rate is None:
-            return result
+            if self._should_apply_default_coinsurance(insurance, pverify_data, service_line):
+                rate = self.default_coinsurance_rate
+                using_default_rate = True
+            else:
+                return result
 
         result['rate'] = rate
+        result['used_default_rate'] = using_default_rate
 
         if service_line == 'IM ketamine':
             total_fee = self._sum_cpt_fees(self.coinsurance_fee_map.get('IM ketamine', []))
@@ -1703,7 +1733,11 @@ class PatientResponsibilityAgent:
                 if im_pr > 0 and amount > im_pr:
                     amount = im_pr
 
-            if override['rate'] is not None:
+            if override.get('used_default_rate'):
+                logger.debug(
+                    f"Coinsurance override applied for {service_line} using default {override['rate'] * 100:.2f}% rate = ${amount:.2f}"
+                )
+            elif override['rate'] is not None:
                 logger.debug(
                     f"Coinsurance override applied for {service_line}: {override['rate'] * 100:.2f}% of fee schedule = ${amount:.2f}"
                 )

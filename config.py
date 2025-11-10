@@ -23,6 +23,9 @@ PROCESSING_CONFIG = {
     'coinsurance_multiplier': 400  # Amount to multiply coinsurance percentage by
 }
 
+# Default coinsurance rate (as a decimal) applied when eligibility data is unavailable
+DEFAULT_COINSURANCE_RATE = float(os.getenv('DEFAULT_COINSURANCE_RATE', 0.2))
+
 # Medicaid Insurance Indicators
 MEDICAID_INDICATORS = ['MCD', 'MEDICAID', 'HEALTH FIRST MEDICAID']
 
