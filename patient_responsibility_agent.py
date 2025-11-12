@@ -24,7 +24,6 @@ import uuid
 import contextlib
 import psycopg2
 import psycopg2.extras
-from sshtunnel import SSHTunnelForwarder
 import config
 
 # Configure logging
@@ -757,57 +756,23 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 @contextlib.contextmanager
-def _pg_conn_via_ssh():
+def _pg_conn():
     """
-    Yields a psycopg2 connection to RDS through an SSH tunnel (or direct if USE_SSH=0).
+    Yields a psycopg2 connection to the database.
     SSL is enforced (sslmode=require).
     """
-    if not config.SSH_CONFIG['use_ssh']:
-        conn = psycopg2.connect(
-            host=config.DB_CONFIG['host'],
-            port=config.DB_CONFIG['port'],
-            dbname=config.DB_CONFIG['database'],
-            user=config.DB_CONFIG['username'],
-            password=config.DB_CONFIG['password'],
-            sslmode=config.DB_CONFIG['sslmode'],
-        )
-        try:
-            yield conn
-        finally:
-            conn.close()
-        return
-
-    # Check if SSH key file exists and is readable
-    ssh_key_path = config.SSH_CONFIG['private_key_path']
-    if not os.path.isfile(ssh_key_path):
-        raise FileNotFoundError(f"SSH private key file not found: {ssh_key_path}")
-    
-    # Log SSH connection details (without sensitive info)
-    logger.info(f"Establishing SSH tunnel to {config.SSH_CONFIG['bastion_host']}:{config.SSH_CONFIG['bastion_port']} as {config.SSH_CONFIG['bastion_user']}")
-    
-    server = SSHTunnelForwarder(
-        (config.SSH_CONFIG['bastion_host'], config.SSH_CONFIG['bastion_port']),
-        ssh_username=config.SSH_CONFIG['bastion_user'],
-        ssh_pkey=ssh_key_path,
-        remote_bind_address=(config.DB_CONFIG['host'], config.DB_CONFIG['port']),
-        set_keepalive=60.0,
+    conn = psycopg2.connect(
+        host=config.DB_CONFIG['host'],
+        port=config.DB_CONFIG['port'],
+        dbname=config.DB_CONFIG['database'],
+        user=config.DB_CONFIG['username'],
+        password=config.DB_CONFIG['password'],
+        sslmode=config.DB_CONFIG['sslmode'],
     )
-    server.start()
     try:
-        conn = psycopg2.connect(
-            host="127.0.0.1",
-            port=server.local_bind_port,
-            dbname=config.DB_CONFIG['database'],
-            user=config.DB_CONFIG['username'],
-            password=config.DB_CONFIG['password'],
-            sslmode=config.DB_CONFIG['sslmode'],
-        )
-        try:
-            yield conn
-        finally:
-            conn.close()
+        yield conn
     finally:
-        server.stop()
+        conn.close()
 
 def log_agent_run_success(selected_plan_name: str, started_at_utc: datetime, ended_at_utc: datetime, documents_processed: int = 1):
     """
@@ -841,7 +806,7 @@ def log_agent_run_success(selected_plan_name: str, started_at_utc: datetime, end
     )
 
     try:
-        with _pg_conn_via_ssh() as conn:
+        with _pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, args)
             conn.commit()
@@ -877,7 +842,7 @@ def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_u
     )
 
     try:
-        with _pg_conn_via_ssh() as conn:
+        with _pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, args)
             conn.commit()
