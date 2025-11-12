@@ -6,7 +6,7 @@ import os
 # AdvancedMD API Configuration
 AMD_CONFIG = {
     'base_url': 'https://providerapi.advancedmd.com/processrequest/api-128/NANONETS-HEALTH/xmlrpc/processrequest.aspx',
-    'api_base_url': 'https://providerapi.advancedmd.com/api/api-801/TEMP',
+    'api_base_url': 'https://providerapi.advancedmd.com/api/api-128/NANONETS-HEALTH',
     'username': os.getenv('AMD_USERNAME'),
     'password': os.getenv('AMD_PASSWORD'),
     'office_code': int(os.getenv('AMD_OFFICE_CODE', 0)),
