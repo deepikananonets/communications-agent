@@ -62,7 +62,7 @@ async def trigger_processing():
         logger.info("Trigger endpoint called - starting patient responsibility processing...")
         
         
-        agent = PatientResponsibilityAgent(config.ZAPIER_WEBHOOK_URL)
+        agent = PatientResponsibilityAgent()
         
         # Run processing
         agent.process_patients()

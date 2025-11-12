@@ -17,11 +17,8 @@ logging.basicConfig(
 def main():
     """Example usage of the Patient Responsibility Agent."""
     
-    # Your actual Zapier webhook URL
-    zapier_webhook_url = "https://hooks.zapier.com/hooks/catch/YOUR_HOOK_ID/YOUR_HOOK_ID/"
-    
     # Initialize the agent
-    agent = PatientResponsibilityAgent(zapier_webhook_url)
+    agent = PatientResponsibilityAgent()
     
     try:
         print("Starting Patient Responsibility Memo Agent...")
