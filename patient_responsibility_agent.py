@@ -747,6 +747,10 @@ def _pg_conn():
     Yields a psycopg2 connection to the database.
     SSL is enforced (sslmode=require).
     """
+    # Check if database is configured
+    if not config.DB_CONFIG['host']:
+        raise ValueError("Database not configured: FLEMING_DB_HOST environment variable is not set")
+    
     conn = psycopg2.connect(
         host=config.DB_CONFIG['host'],
         port=config.DB_CONFIG['port'],
@@ -797,6 +801,9 @@ def log_agent_run_success(selected_plan_name: str, started_at_utc: datetime, end
                 cur.execute(sql, args)
             conn.commit()
         logger.info("agent_run_logs: success row inserted")
+    except ValueError as e:
+        # Database not configured - log warning but don't fail
+        logger.warning(f"Database logging skipped: {e}")
     except Exception as e:
         logger.error(f"Failed to write agent_run_logs: {e}", exc_info=True)
 
@@ -833,6 +840,9 @@ def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_u
                 cur.execute(sql, args)
             conn.commit()
         logger.info("agent_run_logs: error row inserted")
+    except ValueError as e:
+        # Database not configured - log warning but don't fail
+        logger.warning(f"Database logging skipped: {e}")
     except Exception as e:
         logger.error(f"Failed to write agent_run_logs error: {e}", exc_info=True)
 
