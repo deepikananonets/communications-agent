@@ -7,6 +7,10 @@ This server provides:
 - Trigger endpoint to run the patient responsibility processing
 """
 
+# Load environment variables from .env file before importing config
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from datetime import datetime
