@@ -50,6 +50,11 @@ class AdvancedMDAPI:
         
     def authenticate(self) -> bool:
         """Authenticate with AdvancedMD and get session token."""
+        # Check if credentials are configured
+        if not self.username or not self.password:
+            logger.error("AdvancedMD credentials not configured. Please set AMD_USERNAME and AMD_PASSWORD environment variables.")
+            return False
+        
         payload = {
             "ppmdmsg": {
                 "@action": "login",
@@ -70,6 +75,10 @@ class AdvancedMDAPI:
             )
             response.raise_for_status()
             
+            # Log response for debugging (first 500 chars to avoid logging sensitive data)
+            logger.debug(f"Authentication response status: {response.status_code}")
+            logger.debug(f"Authentication response (first 500 chars): {response.text[:500]}")
+            
             # Parse XML response to extract token
             root = ET.fromstring(response.text)
             usercontext = root.find('.//usercontext')
@@ -78,11 +87,23 @@ class AdvancedMDAPI:
                 logger.info("Successfully authenticated with AdvancedMD")
                 return True
             else:
-                logger.error("Failed to extract token from response")
+                # Check for error messages in the response
+                error_elem = root.find('.//error')
+                if error_elem is not None:
+                    error_msg = error_elem.text if error_elem.text else "Unknown error"
+                    logger.error(f"Authentication error from AdvancedMD: {error_msg}")
+                else:
+                    logger.error(f"Failed to extract token from response. Response structure: {ET.tostring(root, encoding='unicode')[:500]}")
                 return False
                 
+        except ET.ParseError as e:
+            logger.error(f"Failed to parse XML response: {e}")
+            logger.error(f"Response text: {response.text[:500] if 'response' in locals() else 'No response'}")
+            return False
         except Exception as e:
             logger.error(f"Authentication failed: {e}")
+            if 'response' in locals():
+                logger.error(f"Response status: {response.status_code}, Response text: {response.text[:500]}")
             return False
     
     def get_updated_patients(self, hours_back: int = 24) -> List[Dict]:
