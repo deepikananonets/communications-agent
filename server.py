@@ -61,12 +61,6 @@ async def trigger_processing():
     try:
         logger.info("Trigger endpoint called - starting patient responsibility processing...")
         
-        # Initialize agent
-        if not config.ZAPIER_WEBHOOK_URL:
-            raise HTTPException(
-                status_code=500,
-                detail="ZAPIER_WEBHOOK_URL not configured"
-            )
         
         agent = PatientResponsibilityAgent(config.ZAPIER_WEBHOOK_URL)
         

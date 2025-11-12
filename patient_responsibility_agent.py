@@ -711,45 +711,6 @@ class PVerifyAPI:
             return financial_data
 
 
-class ZapierWebhook:
-    """Zapier webhook integration."""
-    
-    def __init__(self, webhook_url: str):
-        self.webhook_url = webhook_url
-    
-    def send_patient_data(self, patient_name: str) -> Optional[str]:
-        """Send patient data to Zapier webhook and get service line response."""
-        payload = {"patient_name": patient_name}
-        
-        try:
-            # Send the request to the webhook URL
-            logger.info(f"Sending webhook request for {patient_name} to {self.webhook_url}")
-            logger.debug(f"Payload: {payload}")
-            
-            response = requests.post(self.webhook_url, json=payload, timeout=30)
-            response.raise_for_status()
-            logger.info(f"Webhook response status: {response.status_code}")
-            
-            # Parse the actual response from Zapier
-            result = response.json()
-            logger.info(f"Zapier response for {patient_name}: {result}")
-            
-            service_line = result.get("Service Type")
-            
-            if not service_line or service_line.strip() == "":
-                logger.warning(f"No service type returned for {patient_name} - skipping patient")
-                return None
-            
-            logger.info(f"Received service line for {patient_name}: {service_line}")
-            return service_line.strip()
-            
-        except Exception as e:
-            logger.warning(f"Webhook request failed for {patient_name}: {e}")
-            logger.info(f"Skipping patient due to webhook failure")
-            # If webhook fails, return None to skip patient
-            return None
-
-
 def utc_now():
     # Return timezone-aware UTC for Postgres timestamptz
     return datetime.now(timezone.utc)
@@ -852,10 +813,9 @@ def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_u
 class PatientResponsibilityAgent:
     """Main agent class that orchestrates the entire workflow."""
     
-    def __init__(self, zapier_webhook_url: str):
+    def __init__(self):
         self.amd_api = AdvancedMDAPI()
         self.pverify_api = PVerifyAPI()
-        self.zapier = ZapierWebhook(zapier_webhook_url)
         self.final_patients = []
         self.run_started = None
         self.documents_processed = 0
@@ -1247,7 +1207,7 @@ class PatientResponsibilityAgent:
 def main():
     """Main execution function."""
     # Initialize and run agent
-    agent = PatientResponsibilityAgent(config.ZAPIER_WEBHOOK_URL)
+    agent = PatientResponsibilityAgent()
     run_started = utc_now()
     
     try:

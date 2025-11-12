@@ -53,14 +53,5 @@ DB_CONFIG = {
     'sslmode': os.getenv('FLEMING_DB_SSLMODE', 'require')
 }
 
-# SSH Configuration for database connection
-SSH_CONFIG = {
-    'use_ssh': os.getenv('USE_SSH', '1').strip().lower() in ("1","true","yes","on"),
-    'bastion_host': os.getenv('FLEMING_SSH_HOST', ''),
-    'bastion_port': int(os.getenv('FLEMING_SSH_PORT', '22')),
-    'bastion_user': os.getenv('FLEMING_SSH_USER', ''),
-    'private_key_path': os.getenv('SSH_PRIVATE_KEY_PATH', '/home/runner/.ssh/id_rsa')
-}
-
 # Agent ID for database logging
 AGENT_ID = os.getenv('AGENT_ID')
