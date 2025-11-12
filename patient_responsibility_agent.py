@@ -19,7 +19,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 import time
 import logging
-import os
 import uuid
 import contextlib
 import psycopg2
