@@ -255,6 +255,11 @@ class AdvancedMDAPI:
                 has_appts = len(appointments) > 0 if isinstance(appointments, list) else bool(appointments)
                 logger.debug(f"Patient {patient_id} has appointments: {has_appts}")
                 return has_appts
+            elif response.status_code == 403:
+                # 403 Forbidden - API endpoint may not be accessible with current permissions
+                # Assume no appointments to allow processing to continue
+                logger.debug(f"Appointments endpoint not accessible for patient {patient_id} (403), assuming no appointments")
+                return False
             else:
                 logger.warning(f"Failed to get appointments for patient {patient_id}: {response.status_code}")
                 return False
