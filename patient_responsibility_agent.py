@@ -66,7 +66,7 @@ def memo_already_logged(patient_name: str, insurance_name: str, memo_text: str, 
         skipped_msg,
     )
     try:
-        with _pg_conn_via_ssh() as conn:
+        with _pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, args)
                 return cur.fetchone() is not None
@@ -1161,7 +1161,7 @@ def log_agent_run_skipped(reason: str, started_at_utc: datetime, ended_at_utc: d
     )
 
     try:
-        with _pg_conn_via_ssh() as conn:
+        with _pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, args)
             conn.commit()
