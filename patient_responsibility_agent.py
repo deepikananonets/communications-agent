@@ -23,6 +23,7 @@ import uuid
 import contextlib
 import psycopg2
 import psycopg2.extras
+from zoneinfo import ZoneInfo
 import config
 
 # Configure logging
@@ -35,6 +36,46 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+def memo_already_logged(patient_name: str, insurance_name: str, memo_text: str, lookback_days: int = 90) -> bool:
+    """
+    Returns True if an identical memo was already logged for this patient (success or skipped)
+    within the lookback window. We match on the exact memo text + patient name.
+    """
+    # Patterns that match how we currently log messages
+    success_msg = f"Patient: {patient_name} | Memo: {memo_text}"
+    skipped_msg = f"Skipped due to posting rules. Patient: {patient_name} | Insurance: {insurance_name} | Memo preview: {memo_text}"
+
+    sql = """
+        SELECT 1
+        FROM agent_run_logs
+        WHERE agent_id = %s::uuid
+          AND status IN ('success','skipped')
+          AND start_time >= (NOW() AT TIME ZONE 'UTC' - (%s || ' days')::interval)
+          AND (
+                output_data->>'message' = %s
+             OR output_data->>'message' = %s
+          )
+        LIMIT 1
+    """
+    args = (
+        str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),
+        lookback_days,
+        success_msg,
+        skipped_msg,
+    )
+    try:
+        with _pg_conn_via_ssh() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, args)
+                return cur.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Failed duplicate-memo check: {e}", exc_info=True)
+        # Be safe: if the check fails, do NOT block posting/logging
+        return False
+
+    
 
 class AdvancedMDAPI:
     """AdvancedMD API client for patient and insurance management."""
@@ -146,7 +187,8 @@ class AdvancedMDAPI:
                     "@copaypercentageamount": "CopayPercentageAmount",
                     "@annualdeductible": "AnnualDeductible",
                     "@deductibleamountmet": "DeductibleAmountMet",
-                    "@subscriberid": "SubscriberID"
+                    "@subscriberid": "SubscriberID",
+                    "@subidnumber": "SubIdNumber"
                 },
                 "referralplan": {
                     "@reason": "Reason",
@@ -179,7 +221,7 @@ class AdvancedMDAPI:
                 sex = patient_elem.get('sex')
                 
                 if not dob or not sex:
-                    logger.warning(f"Skipping patient {patient_elem.get('name')} - missing DOB or sex (DOB: {dob}, Sex: {sex})")
+                    logger.warning(f"Skipping the patient {patient_elem.get('name')} - missing DOB or sex (DOB: {dob}, Sex: {sex})")
                     continue
                 
                 patient_data = {
@@ -214,7 +256,8 @@ class AdvancedMDAPI:
                         'deductibleamountmet': float(insurance_elem.get('deductibleamountmet', 0)),
                         'createdat': insurance_elem.get('createdat'),
                         'changedat': insurance_elem.get('changedat'),
-                        'subscriberid': insurance_elem.get('subscriberid', '').strip() if insurance_elem.get('subscriberid') else ''
+                        'subscriberid': insurance_elem.get('subscriberid', '').strip() if insurance_elem.get('subscriberid') else '',
+                        'subidnumber': insurance_elem.get('subidnumber', '').strip() if insurance_elem.get('subidnumber') else ''
                     }
                     patient_data['insurances'].append(insurance_data)
                 
@@ -230,30 +273,64 @@ class AdvancedMDAPI:
             return []
     
     def has_appointments(self, patient_id: str) -> bool:
-        """Check if patient has appointments."""
+        """Check if patient has appointments using getpatientvisits API."""
         if not self.token:
             return False
             
-        try:
-            url = f"{self.api_base_url}/scheduler/Appointments"
-            params = {
-                'forView': 'patient',
-                'patientId': patient_id
+        payload = {
+            "ppmdmsg": {
+                "@action": "getpatientvisits",
+                "@patientid": patient_id,
+                "@class": "api",
+                "@nocookie": "0",
+                "visit": {
+                    "@color": "Color",
+                    "@duration": "Duration",
+                    "@refreason": "RefReason",
+                    "@apptstatus": "ApptStatus",
+                    "@ByRefProvMiddleName": "ByRefProvMiddleName",
+                    "@ByRefProvFirstName": "ByRefProvFirstName",
+                    "@ByRefProvLastName": "ByRefProvLastName",
+                    "@ByReferringProviderFID": "ByReferringProviderFID",
+                    "@columnheading": "ColumnHeading",
+                    "@AppointmentType": "AppointmentType",
+                    "@AppointmentTypeID": "AppointmentTypeID",
+                    "@Visitstartdatetime": "VisitStartDateTime"
+                },
+                "patient": {
+                    "@createdat": "CreatedAt",
+                    "@changedat": "ChangedAt",
+                    "@ssn": "SSN",
+                    "@name": "Name"
+                },
+                "insurance": {
+                    "@createdat": "CreatedAt",
+                    "@changedat": "ChangedAt",
+                    "@carcode": "CarCode",
+                    "@carname": "CarName"
+                }
             }
+        }
             
-            response = requests.get(
-                url,
+        try:
+            response = requests.post(
+                self.base_url,
                 headers={
                     'Cookie': f'token={self.token}',
-                    'Authorization': f'Bearer {self.token}'
+                    'Content-Type': 'application/json'
                 },
-                params=params
+                json=payload
             )
+            response.raise_for_status()
             
-            if response.status_code == 200:
-                appointments = response.json()
-                has_appts = len(appointments) > 0 if isinstance(appointments, list) else bool(appointments)
-                logger.debug(f"Patient {patient_id} has appointments: {has_appts}")
+            # Parse XML response
+            root = ET.fromstring(response.text)
+            results = root.find('.//Results')
+            
+            if results is not None:
+                visit_count = int(results.get('visitcount', '0'))
+                has_appts = visit_count > 0
+                logger.debug(f"Patient {patient_id} has {visit_count} visits/appointments: {has_appts}")
                 return has_appts
             elif response.status_code == 403:
                 # 403 Forbidden - API endpoint may not be accessible with current permissions
@@ -261,12 +338,122 @@ class AdvancedMDAPI:
                 logger.debug(f"Appointments endpoint not accessible for patient {patient_id} (403), assuming no appointments")
                 return False
             else:
-                logger.warning(f"Failed to get appointments for patient {patient_id}: {response.status_code}")
+                logger.warning(f"No results found in response for patient {patient_id}")
                 return False
                 
         except Exception as e:
             logger.error(f"Error checking appointments for patient {patient_id}: {e}")
             return False
+    
+    def get_appointment_dates(self, patient_id: str) -> List[datetime]:
+        """Get list of appointment dates for a patient."""
+        if not self.token:
+            return []
+            
+        payload = {
+            "ppmdmsg": {
+                "@action": "getpatientvisits",
+                "@patientid": patient_id,
+                "@class": "api",
+                "@nocookie": "0",
+                "visit": {
+                    "@color": "Color",
+                    "@duration": "Duration",
+                    "@refreason": "RefReason",
+                    "@apptstatus": "ApptStatus",
+                    "@ByRefProvMiddleName": "ByRefProvMiddleName",
+                    "@ByRefProvFirstName": "ByRefProvFirstName",
+                    "@ByRefProvLastName": "ByRefProvLastName",
+                    "@ByReferringProviderFID": "ByReferringProviderFID",
+                    "@columnheading": "ColumnHeading",
+                    "@AppointmentType": "AppointmentType",
+                    "@AppointmentTypeID": "AppointmentTypeID",
+                    "@Visitstartdatetime": "VisitStartDateTime"
+                },
+                "patient": {
+                    "@createdat": "CreatedAt",
+                    "@changedat": "ChangedAt",
+                    "@ssn": "SSN",
+                    "@name": "Name"
+                },
+                "insurance": {
+                    "@createdat": "CreatedAt",
+                    "@changedat": "ChangedAt",
+                    "@carcode": "CarCode",
+                    "@carname": "CarName"
+                }
+            }
+        }
+            
+        try:
+            response = requests.post(
+                self.base_url,
+                headers={
+                    'Cookie': f'token={self.token}',
+                    'Content-Type': 'application/json'
+                },
+                json=payload
+            )
+            response.raise_for_status()
+            
+            # Parse XML response
+            root = ET.fromstring(response.text)
+            appointment_dates = []
+            
+            for visit_elem in root.findall('.//visit'):
+                visit_datetime_str = visit_elem.get('visitstartdatetime')
+                if visit_datetime_str:
+                    try:
+                        # Parse ISO format: "2024-02-12T12:45:00"
+                        visit_datetime = datetime.fromisoformat(visit_datetime_str)
+                        appointment_dates.append(visit_datetime)
+                    except ValueError as e:
+                        logger.warning(f"Could not parse appointment datetime '{visit_datetime_str}': {e}")
+                        continue
+            
+            logger.debug(f"Found {len(appointment_dates)} appointments for patient {patient_id}")
+            return appointment_dates
+                
+        except Exception as e:
+            logger.error(f"Error getting appointment dates for patient {patient_id}: {e}")
+            return []
+    
+    def should_process_patient_by_appointments(self, patient_id: str) -> bool:
+        """Check if patient should be processed based on appointment dates.
+        
+        Returns True if:
+        - Patient has no appointments, OR
+        - Patient has at least one appointment tomorrow (Denver time)
+        """
+        appointment_dates = self.get_appointment_dates(patient_id)
+        
+        # If no appointments, include patient
+        if not appointment_dates:
+            logger.debug(f"Patient {patient_id} has no appointments - including")
+            return True
+        
+        # Get tomorrow's date in Denver timezone
+        denver_tz = ZoneInfo('America/Denver')
+        now_denver = datetime.now(denver_tz)
+        tomorrow_denver = (now_denver + timedelta(days=1)).date()
+        
+        logger.debug(f"Checking appointments for patient {patient_id}. Today in Denver: {now_denver.date()}, Tomorrow: {tomorrow_denver}")
+        
+        # Check if any appointment is tomorrow
+        for appt_datetime in appointment_dates:
+            # Assume the datetime from API is in Denver time (no timezone info)
+            # Convert to Denver timezone-aware datetime
+            appt_datetime_denver = appt_datetime.replace(tzinfo=denver_tz)
+            appt_date = appt_datetime_denver.date()
+            
+            logger.debug(f"  Appointment on: {appt_date} at {appt_datetime_denver.time()}")
+            
+            if appt_date == tomorrow_denver:
+                logger.debug(f"Patient {patient_id} has appointment tomorrow ({tomorrow_denver}) - including")
+                return True
+        
+        logger.debug(f"Patient {patient_id} has appointments but none tomorrow - excluding")
+        return False
     
     def submit_eligibility_check(self, patient_id: str, insurance_coverage_id: str) -> Optional[str]:
         """Submit eligibility check request."""
@@ -307,6 +494,9 @@ class AdvancedMDAPI:
             logger.error(f"Failed to submit eligibility check for patient {patient_id}: {e}")
             
         return None
+    
+    
+    
     
     def check_eligibility_response(self, eligibility_id: str) -> Dict:
         """Check eligibility response."""
@@ -354,16 +544,21 @@ class AdvancedMDAPI:
         if not self.token:
             return False
             
+        created_datetime = datetime.now()
+        msgtime_str = created_datetime.strftime("%m/%d/%Y %I:%M:%S %p")
+        created_date_str = created_datetime.strftime("%m/%d/%Y")
+        expire_date_str = (created_datetime + timedelta(days=3)).strftime("%m/%d/%Y")
+
         payload = {
             "ppmdmsg": {
                 "@action": "savememo",
                 "@class": "demographics",
-                "@msgtime": datetime.now().strftime("%m/%d/%Y %I:%M:%S %p"),
+                "@msgtime": msgtime_str,
                 "@patientfid": patient_id,
-                "@created": datetime.now().strftime("%m/%d/%Y"),
+                "@created": created_date_str,
                 "@case_memotext": memo_text,
                 "@memotype": "d",
-                "@expiredate": ""
+                "@expiredate": expire_date_str
             }
         }
         
@@ -432,6 +627,10 @@ class PVerifyAPI:
         }
         
         try:
+            logger.debug(f"PVerify Token Request - URL: {self.token_url}")
+            logger.debug(f"PVerify Token Request - Headers: {{'Content-Type': 'application/x-www-form-urlencoded'}}")
+            logger.debug(f"PVerify Token Request - Payload: {{'Client_Id': '{self.client_id}', 'grant_type': 'client_credentials', 'Client_Secret': '[REDACTED]'}}")
+            
             response = requests.post(
                 self.token_url,
                 headers={'Content-Type': 'application/x-www-form-urlencoded'},
@@ -439,7 +638,12 @@ class PVerifyAPI:
             )
             response.raise_for_status()
             
+            logger.debug(f"PVerify Token Response - Status: {response.status_code}")
+            logger.debug(f"PVerify Token Response - Headers: {dict(response.headers)}")
+            
             token_data = response.json()
+            logger.debug(f"PVerify Token Response - Body: {{'access_token': '[REDACTED]', 'expires_in': {token_data.get('expires_in', 'N/A')}, 'token_type': '{token_data.get('token_type', 'N/A')}'}}")
+            
             self.access_token = token_data['access_token']
             expires_in = token_data.get('expires_in', 3600)  # Default 1 hour
             self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
@@ -449,6 +653,9 @@ class PVerifyAPI:
             
         except Exception as e:
             logger.error(f"Failed to get PVerify access token: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"PVerify Token Error Response - Status: {e.response.status_code}")
+                logger.error(f"PVerify Token Error Response - Body: {e.response.text}")
             return False
     
     def match_insurance_name(self, amd_insurance_name: str, pverify_payer_name: str) -> bool:
@@ -545,6 +752,10 @@ class PVerifyAPI:
         }
         
         try:
+            logger.debug(f"PVerify Discovery Request - URL: {self.discovery_url}")
+            logger.debug(f"PVerify Discovery Request - Headers: {{'Authorization': 'Bearer [REDACTED]', 'Client-API-Id': '{self.client_id}', 'Content-Type': 'application/json'}}")
+            logger.debug(f"PVerify Discovery Request - Patient: {patient.get('name')} - Payload: {json.dumps(payload, indent=2)}")
+            
             response = requests.post(
                 self.discovery_url,
                 headers={
@@ -556,12 +767,19 @@ class PVerifyAPI:
             )
             response.raise_for_status()
             
+            logger.debug(f"PVerify Discovery Response - Status: {response.status_code}")
+            logger.debug(f"PVerify Discovery Response - Headers: {dict(response.headers)}")
+            
             discovery_data = response.json()
+            logger.debug(f"PVerify Discovery Response - Patient: {patient.get('name')} - Body: {json.dumps(discovery_data, indent=2)}")
             logger.debug(f"Insurance discovery for {patient.get('name')}: {discovery_data.get('PayerName', 'No payer found')}")
             return discovery_data
             
         except Exception as e:
             logger.error(f"Insurance discovery failed for {patient.get('name')}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"PVerify Discovery Error Response - Status: {e.response.status_code}")
+                logger.error(f"PVerify Discovery Error Response - Body: {e.response.text}")
             return None
     
     def eligibility_check(self, patient: Dict, insurance: Dict, service_line: str = "NA") -> Dict:
@@ -590,18 +808,31 @@ class PVerifyAPI:
         else:
             service_codes = ["30"]
         
-        # Get member ID - use subscriber ID from insurance or try discovery
+        # Get member ID - prioritize subidnumber, fallback to subscriberid, then discovery
+        subid_number = insurance.get('subidnumber')
         subscriber_id = insurance.get('subscriberid')
-        member_id = subscriber_id.strip() if subscriber_id else ''
+        member_id = ''
         payer_code = None
         
+        # First priority: use subidnumber if available
+        if subid_number and subid_number.strip():
+            member_id = subid_number.strip()
+            logger.debug(f"Using subIdNumber as member ID: {member_id}")
+        # Second priority: use subscriberid if available
+        elif subscriber_id and subscriber_id.strip():
+            member_id = subscriber_id.strip()
+            logger.debug(f"Using subscriberID as member ID: {member_id}")
+        
+        # Only run discovery if no member ID found from AMD data
         if not member_id:
+            logger.debug(f"No member ID in AMD data, attempting discovery for {patient.get('name')} - {insurance.get('carname')}")
             # Try insurance discovery to find member ID
             discovery_result = self.insurance_discovery(patient)
             if discovery_result and discovery_result.get('PayerFound'):
                 # Check if discovered insurance matches AMD insurance
                 if self.match_insurance_name(insurance.get('carname', ''), discovery_result.get('PayerName', '')):
                     member_id = discovery_result.get('MemberID', '')
+                    logger.debug(f"Found member ID via discovery: {member_id}")
                     # Extract payer code if available
                     if 'ComboPayerResponses' in discovery_result:
                         for payer_resp in discovery_result['ComboPayerResponses']:
@@ -613,9 +844,36 @@ class PVerifyAPI:
             logger.warning(f"No member ID found for {patient.get('name')} - {insurance.get('carname')}")
             return {}
         
-        # Default payer code if not found
+        # Map insurance name to payer code if not found from discovery
         if not payer_code:
-            payer_code = "00192"  # Generic code
+            insurance_name = insurance.get('carname', '').upper()
+            
+            # Map common payer names to their PVerify payer codes
+            if 'CIGNA' in insurance_name:
+                payer_code = "00004"  # Cigna
+            elif 'UNITED' in insurance_name or 'UHC' in insurance_name or 'UNITEDHEALTHCARE' in insurance_name:
+                payer_code = "00192"  # United Healthcare
+            elif 'AETNA' in insurance_name:
+                payer_code = "00001"  # Aetna
+            elif 'BLUE CROSS' in insurance_name or 'BCBS' in insurance_name or 'BLUE SHIELD' in insurance_name:
+                if 'TEXAS' in insurance_name or 'TBS' in insurance_name:
+                    payer_code = "00220"  # Blue Cross Blue Shield of Texas
+                elif 'COLORADO' in insurance_name:
+                    payer_code = "00210"  # Blue Cross Blue Shield of Colorado
+                elif 'ANTHEM' in insurance_name:
+                    payer_code = "00210"  # Anthem BCBS
+                else:
+                    payer_code = "00210"  # Blue Cross Blue Shield
+            elif 'HUMANA' in insurance_name:
+                payer_code = "00112"  # Humana
+            elif 'MEDICARE' in insurance_name:
+                payer_code = "00007"  # Medicare
+            elif 'MEDICAID' in insurance_name:
+                payer_code = "00071"  # Medicaid
+            else:
+                payer_code = "00192"  # Default to United Healthcare as fallback
+        
+        logger.debug(f"Using payer code: {payer_code} for insurance: {insurance.get('carname')}")
         
         payload = {
             "payerCode": payer_code,
@@ -641,6 +899,10 @@ class PVerifyAPI:
         }
         
         try:
+            logger.debug(f"PVerify Eligibility Request - URL: {self.eligibility_url}")
+            logger.debug(f"PVerify Eligibility Request - Headers: {{'Authorization': 'Bearer [REDACTED]', 'Client-API-Id': '{self.client_id}', 'Content-Type': 'application/json'}}")
+            logger.debug(f"PVerify Eligibility Request - Patient: {patient.get('name')} - Insurance: {insurance.get('carname')} - Payload: {json.dumps(payload, indent=2)}")
+            
             response = requests.post(
                 self.eligibility_url,
                 headers={
@@ -652,12 +914,19 @@ class PVerifyAPI:
             )
             response.raise_for_status()
             
+            logger.debug(f"PVerify Eligibility Response - Status: {response.status_code}")
+            logger.debug(f"PVerify Eligibility Response - Headers: {dict(response.headers)}")
+            
             eligibility_data = response.json()
+            logger.debug(f"PVerify Eligibility Response - Patient: {patient.get('name')} - Insurance: {insurance.get('carname')} - Body: {json.dumps(eligibility_data, indent=2)}")
             logger.info(f"Eligibility check completed for {patient.get('name')} - Status: {eligibility_data.get('status', 'Unknown')}")
             return eligibility_data
             
         except Exception as e:
             logger.error(f"Eligibility check failed for {patient.get('name')}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"PVerify Eligibility Error Response - Status: {e.response.status_code}")
+                logger.error(f"PVerify Eligibility Error Response - Body: {e.response.text}")
             return {}
     
     def extract_financial_data(self, eligibility_data: Dict) -> Dict:
@@ -665,69 +934,124 @@ class PVerifyAPI:
         financial_data = {
             'copay': 0.0,
             'coinsurance': 0.0,
-            'deductible': 0.0
+            'deductible': 0.0,
+            'deductible_remaining': 0.0,
+            'annual_deductible': 0.0,
+            'deductible_met': 0.0,
+            'copay_found': False,
+            'coinsurance_found': False
         }
+        
+        # Check if eligibility status is inactive or null - return default values
+        status = eligibility_data.get('status')
+        if status is None:
+            # Log additional error information if available
+            error_code = eligibility_data.get('errorCode')
+            error_description = eligibility_data.get('errorDescription')
+            if error_code or error_description:
+                logger.warning(f"PVerify eligibility error - Code: {error_code}, Description: {error_description}")
+            logger.debug("Eligibility status is null (likely error response), returning default financial data")
+            return financial_data
+        elif status.lower() == 'inactive':
+            logger.debug("Eligibility status is inactive, returning default financial data")
+            return financial_data
         
         try:
             # Check networkSections for summary data
             network_sections = eligibility_data.get('networkSections', [])
-            for section in network_sections:
-                if section.get('identifier') == 'Specialist':
-                    in_network = section.get('inNetworkParameters', [])
-                    for param in in_network:
-                        key = param.get('key', '').lower()
-                        value = param.get('value', '').strip()
-                        
-                        if 'co-pay' in key and value:
-                            try:
-                                financial_data['copay'] = float(value.replace('$', '').replace(',', ''))
-                            except ValueError:
-                                pass
-                        elif 'co-ins' in key and value:
-                            try:
-                                financial_data['coinsurance'] = float(value.replace('%', ''))
-                            except ValueError:
-                                pass
+            if network_sections:  # Add null check
+                for section in network_sections:
+                    if section and section.get('identifier') == 'Specialist':
+                        in_network = section.get('inNetworkParameters', [])
+                        if in_network:  # Add null check
+                            for param in in_network:
+                                if param:  # Add null check for individual param
+                                    key = param.get('key', '').lower()
+                                    value = param.get('value') or ''
+                                    value = value.strip() if value else ''
+                                    
+                                    if 'co-pay' in key and value:
+                                        financial_data['copay_found'] = True
+                                        try:
+                                            financial_data['copay'] = float(value.replace('$', '').replace(',', ''))
+                                        except ValueError:
+                                            pass
+                                    elif 'co-ins' in key and value:
+                                        financial_data['coinsurance_found'] = True
+                                        try:
+                                            financial_data['coinsurance'] = float(value.replace('%', ''))
+                                        except ValueError:
+                                            pass
             
             # Check detailed service types for more comprehensive data
             service_types = eligibility_data.get('servicesTypes', [])
-            for service_type in service_types:
-                service_name = service_type.get('serviceTypeName', '')
-                
-                # Focus on relevant service types
-                if any(keyword in service_name.lower() for keyword in ['professional', 'physician', 'office']):
-                    sections = service_type.get('serviceTypeSections', [])
-                    
-                    for section in sections:
-                        label = section.get('label', '')
-                        if 'in plan-network' in label.lower() or 'applies to' in label.lower():
-                            params = section.get('serviceParameters', [])
+            if service_types:  # Add null check
+                for service_type in service_types:
+                    if service_type:  # Add null check
+                        service_name = service_type.get('serviceTypeName', '')
+                        
+                        # Focus on relevant service types
+                        if any(keyword in service_name.lower() for keyword in ['professional', 'physician', 'office']):
+                            sections = service_type.get('serviceTypeSections', [])
                             
-                            for param in params:
-                                key = param.get('key', '').lower()
-                                value = param.get('value', '').strip()
-                                
-                                if 'co-payment' in key and value and '$' in value:
-                                    try:
-                                        copay_val = float(value.replace('$', '').replace(',', ''))
-                                        if copay_val > financial_data['copay']:
-                                            financial_data['copay'] = copay_val
-                                    except ValueError:
-                                        pass
-                                elif 'co-insurance' in key and value and '%' in value:
-                                    try:
-                                        coins_val = float(value.replace('%', ''))
-                                        if coins_val > financial_data['coinsurance']:
-                                            financial_data['coinsurance'] = coins_val
-                                    except ValueError:
-                                        pass
-                                elif 'deductible' in key and value and '$' in value:
-                                    try:
-                                        deduct_val = float(value.replace('$', '').replace(',', ''))
-                                        if deduct_val > financial_data['deductible']:
-                                            financial_data['deductible'] = deduct_val
-                                    except ValueError:
-                                        pass
+                            if sections:  # Add null check
+                                for section in sections:
+                                    if section:  # Add null check
+                                        label = section.get('label', '')
+                                        if 'in plan-network' in label.lower() or 'applies to' in label.lower():
+                                            params = section.get('serviceParameters', [])
+                                            
+                                            if params:  # Add null check
+                                                for param in params:
+                                                    if param:  # Add null check for individual param
+                                                        key = param.get('key', '').lower()
+                                                        value = param.get('value') or ''
+                                                        value = value.strip() if value else ''
+                                                        
+                                                        if 'co-payment' in key and value and '$' in value:
+                                                            financial_data['copay_found'] = True
+                                                            try:
+                                                                copay_val = float(value.replace('$', '').replace(',', ''))
+                                                                if copay_val > financial_data['copay']:
+                                                                    financial_data['copay'] = copay_val
+                                                            except ValueError:
+                                                                pass
+                                                        elif 'co-insurance' in key and value and '%' in value:
+                                                            financial_data['coinsurance_found'] = True
+                                                            try:
+                                                                coins_val = float(value.replace('%', ''))
+                                                                if coins_val > financial_data['coinsurance']:
+                                                                    financial_data['coinsurance'] = coins_val
+                                                            except ValueError:
+                                                                pass
+                                                        elif 'deductible' in key and value and '$' in value:
+                                                            try:
+                                                                deduct_val = float(value.replace('$', '').replace(',', ''))
+                                                                if 'remaining' in key or 'left' in key or 'balance' in key:
+                                                                    if deduct_val > financial_data['deductible_remaining']:
+                                                                        financial_data['deductible_remaining'] = deduct_val
+                                                                elif 'met' in key or 'satisfied' in key:
+                                                                    if deduct_val > financial_data['deductible_met']:
+                                                                        financial_data['deductible_met'] = deduct_val
+                                                                elif 'annual' in key or 'yearly' in key:
+                                                                    if deduct_val > financial_data['annual_deductible']:
+                                                                        financial_data['annual_deductible'] = deduct_val
+                                                                else:
+                                                                    # Generic deductible - could be annual or remaining
+                                                                    if deduct_val > financial_data['deductible']:
+                                                                        financial_data['deductible'] = deduct_val
+                                                            except ValueError:
+                                                                pass
+            
+            # Calculate deductible_remaining if we have annual and met amounts
+            if financial_data['annual_deductible'] > 0 and financial_data['deductible_met'] >= 0:
+                calculated_remaining = financial_data['annual_deductible'] - financial_data['deductible_met']
+                if financial_data['deductible_remaining'] == 0 or calculated_remaining > 0:
+                    financial_data['deductible_remaining'] = max(0, calculated_remaining)
+            
+            # If we only have a generic deductible value, assume it's remaining
+            elif financial_data['deductible'] > 0 and financial_data['deductible_remaining'] == 0:
+                financial_data['deductible_remaining'] = financial_data['deductible']
             
             logger.debug(f"Extracted financial data: {financial_data}")
             return financial_data
@@ -764,6 +1088,14 @@ def _pg_conn():
     finally:
         conn.close()
 
+
+def _is_financial_data_empty(fin: Dict) -> bool:
+    return all((fin.get(k, 0) or 0) == 0 for k in [
+        'copay','coinsurance','deductible','deductible_remaining',
+        'annual_deductible','deductible_met'
+    ])
+
+
 def log_agent_run_success(patient_memo: str, started_at_utc: datetime, ended_at_utc: datetime, documents_processed: int = 1):
     """
     Inserts a success row into agent_run_logs with explicit casts to match DB types.
@@ -779,13 +1111,13 @@ def log_agent_run_success(patient_memo: str, started_at_utc: datetime, ended_at_
            output_data, start_time, end_time, call_id, listen_url,
            control_url, manual_trigger)
         VALUES
-          (%s::uuid, NULL::int, %s::int, %s, %s::jsonb, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
+          (%s::uuid, NULL::int, %s::int, %s, %s, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
     """
     args = (
         str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),  # ensure UUID type
         int(documents_processed),                 # int
         "success",                                # text
-        output_payload,                           # jsonb (already wrapped in Json)
+        output_payload,
         started_at_utc,                           # timestamptz
         ended_at_utc,                             # timestamptz
         False,                                    # bool
@@ -803,14 +1135,12 @@ def log_agent_run_success(patient_memo: str, started_at_utc: datetime, ended_at_
     except Exception as e:
         logger.error(f"Failed to write agent_run_logs: {e}", exc_info=True)
 
-def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_utc: datetime):
+
+def log_agent_run_skipped(reason: str, started_at_utc: datetime, ended_at_utc: datetime, documents_processed: int = 0):
     """
-    Inserts an error row into agent_run_logs.
+    Inserts a 'skipped' row into agent_run_logs (e.g., filtered by posting rules).
     """
-    output_payload = {
-        "message": "Patient responsibility processing failed",
-        "error": error_message
-    }
+    output_payload = psycopg2.extras.Json({"message": reason})
 
     sql = """
         INSERT INTO agent_run_logs 
@@ -818,13 +1148,48 @@ def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_u
            output_data, start_time, end_time, call_id, listen_url,
            control_url, manual_trigger)
         VALUES
-          (%s::uuid, NULL::int, %s::int, %s, %s::jsonb, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
+          (%s::uuid, NULL::int, %s::int, %s, %s, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
+    """
+    args = (
+        str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),
+        int(documents_processed),
+        "skipped",                               # <-- status
+        output_payload,
+        started_at_utc,
+        ended_at_utc,
+        False,
+    )
+
+    try:
+        with _pg_conn_via_ssh() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, args)
+            conn.commit()
+        logger.info("agent_run_logs: skipped row inserted")
+    except Exception as e:
+        logger.error(f"Failed to write agent_run_logs skipped: {e}", exc_info=True)
+
+
+
+def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_utc: datetime):
+    """
+    Inserts an error row into agent_run_logs.
+    """
+    output_payload = psycopg2.extras.Json({"message": error_message})
+
+    sql = """
+        INSERT INTO agent_run_logs 
+          (agent_id, service_request_id, documents_processed, status,
+           output_data, start_time, end_time, call_id, listen_url,
+           control_url, manual_trigger)
+        VALUES
+          (%s::uuid, NULL::int, %s::int, %s, %s, %s::timestamptz, %s::timestamptz, NULL, NULL, NULL, %s)
     """
     args = (
         str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),  # ensure UUID type
         0,                                        # int - no documents processed on error
         "error",                                  # text
-        psycopg2.extras.Json(output_payload),     # json -> jsonb
+        output_payload,
         started_at_utc,                           # timestamptz
         ended_at_utc,                             # timestamptz
         False,                                    # bool
@@ -851,6 +1216,325 @@ class PatientResponsibilityAgent:
         self.final_patients = []
         self.run_started = None
         self.documents_processed = 0
+        
+        # Initialize data structures for enhanced calculations
+        self._init_service_line_mappings()
+        self._init_payer_mappings()
+        self._init_allowed_amounts()
+        self._init_paid_amounts()
+        self._init_cpt_fees()
+        self._init_coinsurance_fee_mappings()
+        self.default_coinsurance_rate = float(getattr(config, 'DEFAULT_COINSURANCE_RATE', 0.0) or 0.0)
+    
+    def _init_service_line_mappings(self):
+        """Initialize service line to CPT code mappings."""
+        self.service_line_cpt_mapping = {
+            'KAP': ['90791', '90837', '96130'],
+            'Spravato': ['G2083'],
+            'Med Management (Psych E/M)': ['99204', '99205', '99215', '99417'],
+            'IM ketamine': ['96372', '96372-59', 'J3490', 'J3490-GA']
+        }
+    
+    def _init_payer_mappings(self):
+        """Initialize insurance name to payer code mappings."""
+        self.payer_mappings = {
+            # Health First Medicaid
+            'HFM': ['HEALTH FIRST MEDICAID', 'HFM', 'MEDICAID'],
+            # Texas Blue Shield  
+            'TBS': ['TEXAS BLUE SHIELD', 'TBS', 'BLUE CROSS BLUE SHIELD OF TEXAS', 'BCBS TEXAS'],
+            # Anthem BCBS
+            'ANT': ['ANTHEM', 'ANTHEM BLUE CROSS', 'ANTHEM BCBS', 'ANTHEM BLUE CROSS BLUE SHIELD'],
+            # Colorado Access
+            'COA': ['COLORADO ACCESS', 'COA'],
+            # United Healthcare
+            'UHC': ['UNITED HEALTHCARE', 'UHC', 'UNITED', 'UNITEDHEALTHCARE'],
+            # Medicare
+            'MCR': ['MEDICARE', 'MCR', 'MEDICARE ADVANTAGE']
+        }
+    
+    def _init_allowed_amounts(self):
+        """Initialize allowed amounts lookup table."""
+        self.allowed_amounts = {
+            'HFM': {
+                '99215': 150.45, 'G2083': 1258.52, '99417-4': 176.42, '99417-2': 87.16,
+                '90837': 137.67, '99417-3': 131.17, '96372-59': 29.72, '99215-25': 158.99,
+                '99214': 108.00, 'J3490': 3.48, 'G2212': 94.08, '99417-5': 221.25,
+                '99417': 63.98, 'J3490-GA': 4.22, '96130': 101.74, '99205-25': 186.21,
+                'G2082': 857.80, '99204-25': 137.32, '90791': 160.21, '99417-6': 265.33,
+                '96372': 16.65, '99205-95': 188.38, '99204': 134.08, '96130-59': 34.59
+            },
+            'TBS': {
+                '99215': 132.07, 'G2083': 1005.74, '99417-4': 113.02, '99417-2': 59.35,
+                '90837': 105.12, '99417-3': 87.10, '96372-59': 27.94, '99215-25': 123.91,
+                '99214': 116.90, 'J3490': 9.95, 'G2212': 69.07, '99417-5': 138.14,
+                '99417': 54.88, 'J3490-GA': 5.67, '96130': 134.18, '99205-25': 220.84,
+                '99204-25': 180.38, '90791': 132.92, '99417-6': 206.10, '96372': 24.70,
+                'S0013-84': 1417.14, '99204': 124.34, '96130-59': 106.68
+            },
+            'ANT': {
+                '99215': 180.23, 'G2083': 1243.50, '99417-4': 130.95, '99417-2': 68.18,
+                '90837': 90.66, '99417-3': 98.83, '96372-59': 29.55, '99215-25': 177.63,
+                '99214': 133.80, 'J3490': 8.22, 'G2212': 426.67, '99417-5': 191.29,
+                '99417': 62.64, 'J3490-GA': 7.27, '96130': 129.49, '99205-25': 250.94,
+                'G2082': 892.97, '99204-25': 164.06, '90791': 95.01, '99417-6': 246.64,
+                '96372': 21.13, '99205-95': 260.29, '99204': 177.44, '96130-59': 128.82
+            },
+            'COA': {
+                '99215': 149.29, 'G2083': 1246.12, '99417-4': 174.28, '99417-2': 87.14,
+                '90837': 131.30, '99417-3': 130.71, '96372-59': 22.34, '99214': 108.68,
+                '99417': 55.71, '96130': 134.81, '99205-25': 186.02, '99204-25': 136.94,
+                '90791': 161.37, '96372': 14.78, '99205-95': 188.01, '99204': 136.94,
+                '96130-59': 150.00
+            },
+            'UHC': {
+                '99215': 197.63, '99417-4': 252.10, '99417-2': 59.52, '90837': 138.46,
+                '99417-3': 62.25, '96372-59': 34.60, '99215-25': 188.13, '99214': 104.41,
+                'J3490': 5.77, 'G2212': 173.99, '99417-5': 400.00, '99417': 53.13,
+                'J3490-GA': 10.26, '96130': 135.75, '99205-25': 200.80, '99204-25': 142.27,
+                '90791': 161.20, '99417-6': 360.00, '96372': 19.53, '99204': 125.32,
+                '96130-59': 109.55
+            },
+            'MCR': {
+                '99215': 179.34, '90837': 156.60, '99214': 127.92, 'J3490': 0.20,
+                'G2212': 31.52, '96130': 118.96, '90791': 169.43, '96372': 14.33
+            }
+        }
+
+    def _init_paid_amounts(self):
+        """Initialize paid amounts lookup table."""
+        # NOTE: Omit CPT keys where your sheet shows N/A. No Nones.
+        self.paid_amounts = {
+            'HFM': {
+                '99215': 143.37, 'G2083': 1146.12, '99417-4': 148.82, '99417-2': 86.38,
+                '90837': 28.51, '99417-3': 127.97, '96372-59': 28.02, '99215-25': 69.73,
+                '99214': 99.44, 'J3490': 0.03, 'G2212': 105.03, '99417-5': 197.49,
+                '99417': 57.50, 'J3490-GA': 0.14, '96130': 3.64, '99205-25': 186.21,
+                'G2082': 784.40, '99204-25': 182.92, '90791': 152.36, '99417-6': 256.17,
+                '96372': 15.71, '99205-95': 154.17, '99204': 128.51, '96130-59': 34.59
+            },
+            'TBS': {
+                '99215': 109.04, 'G2083': 482.83, '99417-4': 81.77, '99417-2': 43.67,
+                '90837': 44.09, '99417-3': 59.31, '96372-59': 20.45, '99215-25': 86.94,
+                '99214': 77.48, 'J3490': 1.11, 'G2212': 41.15, '99417-5': 93.02,
+                '99417': 33.41, 'J3490-GA': 0.06, '96130': 44.32, '99205-25': 110.50,
+                '99204-25': 84.36, '90791': 9.89, '99417-6': 72.92, '96372': 19.18,
+                'S0013-84': 412.67, '99204': 98.98, '96130-59': 49.05
+            },
+            'ANT': {
+                '99215': 158.99, 'G2083': 864.40, '99417-4': 93.40, '99417-2': 57.69,
+                '90837': 70.81, '99417-3': 89.36, '96372-59': 23.50, '99215-25': 132.54,
+                '99214': 91.76, 'J3490': 0.03, '99417-5': 99.44, '99417': 42.04,
+                'J3490-GA': 0.01, '96130': 70.11, '99205-25': 105.03, 'G2082': 457.22,
+                '99204-25': 136.79, '90791': 73.58, '99417-6': 116.32, '96372': 16.34,
+                '99205-95': 260.29, '99204': 146.66, '96130-59': 69.26
+                # (G2212 paid was N/A in the sheet → intentionally omitted)
+            },
+            'COA': {
+                '99215': 149.29, 'G2083': 1246.12, '99417-4': 174.28, '99417-2': 87.14,
+                '90837': 112.71, '99417-3': 130.71, '96372-59': 22.34, '99214': 96.00,
+                '99417': 29.05, '96130': 2.45, '99205-25': 186.02, '99204-25': 136.94,
+                '90791': 149.18, '96372': 9.93, '99205-95': 188.01, '99204': 136.94,
+                '96130-59': 150.00
+            },
+            'UHC': {
+                '99215': 125.04, '99417-4': 42.63, '99417-2': 48.43, '90837': 43.21,
+                '99417-3': 52.55, '96372-59': 22.62, '99215-25': 87.36, '99214': 71.03,
+                'J3490': 2.52, 'G2212': 78.24, '99417': 13.13, 'J3490-GA': 1.52,
+                '96130': 16.65, '99205-25': 89.23, '99204-25': 109.42, '90791': 66.02,
+                '99417-6': 78.75, '96372': 15.70, '99204': 62.66, '96130-59': 44.73
+                # (99417-5 paid was N/A in the sheet → intentionally omitted)
+            }
+            # MCR paid cells not clearly visible in the screenshot → leave out for now.
+        }
+
+
+    
+    
+    def _init_cpt_fees(self):
+        """Initialize CPT fee schedule for coinsurance calculations."""
+        self.cpt_fees = {
+            '99214': 200.0,
+            '99215': 349.0,
+            '99213': 100.0,
+            'J3490': 70.0,
+            'S0013 84': 1680.0,
+            'S0013 56': 1120.0,
+            '96372': 30.0,
+            '96130': 150.0,
+            '99417': 320.0,
+            '90791': 175.0,
+            '90837': 160.0,
+            '90833': 80.0,
+            '90834': 149.0,
+            '90836': 99.0,
+            '90853': 45.0
+        }
+
+    def _init_coinsurance_fee_mappings(self):
+        """Initialize CPT mappings used for coinsurance-based calculations."""
+        self.coinsurance_fee_map = {
+            'IM ketamine': ['99215', 'J3490', '99417', '96372'],
+            'Med Management (Psych E/M)': ['99214', 'J3490', '96372']
+        }
+
+    def _sum_cpt_fees(self, cpt_codes: List[str]) -> float:
+        """Sum fee schedule amounts for the provided CPT codes."""
+        total = 0.0
+        missing_codes = []
+        for code in cpt_codes:
+            fee = self.cpt_fees.get(code)
+            if fee is None:
+                missing_codes.append(code)
+                continue
+            total += fee
+
+        if missing_codes:
+            logger.debug(f"No fee configured for CPT codes {missing_codes} during coinsurance calculation")
+
+        return total
+
+    def _get_coinsurance_rate(self, insurance: Dict, pverify_data: Dict) -> Optional[float]:
+        """Return coinsurance rate as a decimal if override conditions are met."""
+        if self.get_payer_type(insurance) == 'Medicaid':
+            return None
+
+        if not pverify_data:
+            return None
+
+        financial_data = pverify_data.get('financial_data') or {}
+        if not financial_data.get('coinsurance_found'):
+            return None
+
+        coinsurance_percent = float(financial_data.get('coinsurance', 0) or 0)
+        if coinsurance_percent <= 0:
+            return None
+
+        # Only apply override when no copay information is present
+        if financial_data.get('copay_found'):
+            return None
+
+        return coinsurance_percent / 100.0
+
+    def _should_apply_default_coinsurance(self, insurance: Dict, pverify_data: Dict, service_line: str) -> bool:
+        """Determine whether to fall back to the default coinsurance rate."""
+        if self.default_coinsurance_rate <= 0:
+            return False
+
+        if service_line not in self.coinsurance_fee_map:
+            return False
+
+        payer_type = self.get_payer_type(insurance)
+        if payer_type in ('Medicaid', 'Self-Pay'):
+            return False
+
+        if pverify_data:
+            financial_data = pverify_data.get('financial_data') or {}
+            if financial_data.get('copay_found'):
+                return False
+            if financial_data.get('coinsurance_found'):
+                return False
+
+        return True
+
+    def _evaluate_coinsurance_override(self, insurance: Dict, pverify_data: Dict, service_line: str) -> Dict[str, Optional[float]]:
+        """Determine if the coinsurance override applies for the given service line."""
+        result = {
+            'applies': False,
+            'amount': None,
+            'force_per_elig': False,
+            'rate': None,
+            'used_default_rate': False
+        }
+
+        rate = self._get_coinsurance_rate(insurance, pverify_data)
+        using_default_rate = False
+
+        if rate is None:
+            if self._should_apply_default_coinsurance(insurance, pverify_data, service_line):
+                rate = self.default_coinsurance_rate
+                using_default_rate = True
+            else:
+                return result
+
+        result['rate'] = rate
+        result['used_default_rate'] = using_default_rate
+
+        if service_line == 'IM ketamine':
+            total_fee = self._sum_cpt_fees(self.coinsurance_fee_map.get('IM ketamine', []))
+            if total_fee > 0:
+                result['applies'] = True
+                result['amount'] = round(rate * total_fee, 2)
+            return result
+
+        if service_line == 'Med Management (Psych E/M)':
+            total_fee = self._sum_cpt_fees(self.coinsurance_fee_map.get('Med Management (Psych E/M)', []))
+            if total_fee > 0:
+                result['applies'] = True
+                result['amount'] = round(rate * total_fee, 2)
+            return result
+
+        if service_line in ('KAP', 'Spravato'):
+            result['applies'] = True
+            result['force_per_elig'] = True
+            return result
+
+        return result
+
+
+    
+    def get_payer_code(self, insurance_name: str) -> Optional[str]:
+        """Map insurance name to payer code for allowed amounts lookup."""
+        insurance_upper = insurance_name.upper().strip()
+        
+        # Check each payer mapping
+        for payer_code, name_variants in self.payer_mappings.items():
+            for variant in name_variants:
+                if variant in insurance_upper:
+                    return payer_code
+        
+        # Check for common patterns not in explicit mappings
+        if any(term in insurance_upper for term in ['BLUE CROSS', 'BCBS', 'BLUE SHIELD']):
+            if 'TEXAS' in insurance_upper:
+                return 'TBS'
+            elif 'ANTHEM' in insurance_upper:
+                return 'ANT'
+            else:
+                return 'TBS'  # Default to TBS for other BCBS variants
+        
+        # Return None if no match found - will use average calculation
+        return None
+    
+    def get_average_allowed_amount(self, cpt_code: str) -> float:
+        """Calculate average allowed amount across all payers for a CPT code."""
+        amounts = []
+        for payer_code, payer_amounts in self.allowed_amounts.items():
+            if cpt_code in payer_amounts:
+                amounts.append(payer_amounts[cpt_code])
+        
+        return sum(amounts) / len(amounts) if amounts else 0.0
+
+    
+    def get_average_patient_share(self, cpt_code: str) -> float:
+        """
+        Average patient share for a CPT across all payers with data.
+        Rule per payer:
+          - If Allowed and Paid exist → share = max(0, Allowed - Paid)
+          - If Allowed exists but Paid missing → share = Allowed
+          - If no Allowed → ignore that payer
+        """
+        shares = []
+        for payer_code, allowed_map in self.allowed_amounts.items():
+            allowed = allowed_map.get(cpt_code)
+            if allowed is None:
+                continue
+            paid = (self.paid_amounts.get(payer_code, {}) or {}).get(cpt_code)
+            if paid is None:
+                shares.append(float(allowed))
+            else:
+                shares.append(max(0.0, float(allowed) - float(paid)))
+        return round(sum(shares) / len(shares), 2) if shares else 0.0
+
+    
     
     def is_medicaid_insurance(self, insurance: Dict) -> bool:
         """Check if insurance is Medicaid based on carcode or carname."""
@@ -964,61 +1648,310 @@ class PatientResponsibilityAgent:
         # Default to Commercial
         return 'Commercial'
     
+
+
+    def calculate_service_line_responsibility_enhanced(self, insurance: Dict, pverify_data: Dict, service_line: str) -> float:
+        """
+        Calculate patient responsibility using the Allowed vs Paid table.
+    
+        Rules:
+        - Medicaid: $0 for ALL service lines (no PR).
+        - Self-Pay: IM=$399, Spravato=$949 (overrides). Others fall through.
+        - MedMan (Med Management): Can never exceed IM ketamine PR; use office visit copay as reference
+        - Otherwise, for each CPT in the service line:
+            * If both Allowed and Paid exist for payer: use max(Allowed - Paid, 0).
+            * If Allowed exists but Paid missing: use Allowed.
+            * If both missing (or payer not mapped for that CPT):
+                  use average patient share across payers where both exist;
+                  if none exist, use average Allowed.
+        """
+        payer_type = self.get_payer_type(insurance)
+    
+        # Medicaid overrides — ALL service lines → $0 PR
+        if payer_type == 'Medicaid':
+            return 0.0
+    
+        # Self-Pay overrides
+        if payer_type == 'Self-Pay':
+            if service_line == 'IM ketamine':
+                return 399.0
+            if service_line == 'Spravato':
+                return 949.0
+            # For other self-pay lines, fall through to table-based estimate (rare)
+
+        override = self._evaluate_coinsurance_override(insurance, pverify_data, service_line)
+        if override['applies']:
+            if override['force_per_elig']:
+                logger.debug(
+                    f"Coinsurance override forcing 'Per Elig' for {service_line} (coinsurance={override['rate'] * 100 if override['rate'] is not None else 'N/A'}%)"
+                )
+                return 0.0
+
+            amount = override['amount'] if override['amount'] is not None else 0.0
+            if service_line == 'Med Management (Psych E/M)':
+                im_pr = self.calculate_service_line_responsibility_enhanced(insurance, pverify_data, 'IM ketamine')
+                if im_pr > 0 and amount > im_pr:
+                    amount = im_pr
+
+            if override.get('used_default_rate'):
+                logger.debug(
+                    f"Coinsurance override applied for {service_line} using default {override['rate'] * 100:.2f}% rate = ${amount:.2f}"
+                )
+            elif override['rate'] is not None:
+                logger.debug(
+                    f"Coinsurance override applied for {service_line}: {override['rate'] * 100:.2f}% of fee schedule = ${amount:.2f}"
+                )
+            else:
+                logger.debug(f"Coinsurance override applied for {service_line}: ${amount:.2f}")
+            return amount
+    
+        # Get CPTs for this service line
+        cpt_codes = self.service_line_cpt_mapping.get(service_line, [])
+        if not cpt_codes:
+            return 0.0
+    
+        insurance_name = insurance.get('carname', '') or ''
+        payer_code = self.get_payer_code(insurance_name)
+    
+        def avg_patient_share_for_cpt(cpt: str) -> float:
+            """Average of (Allowed - Paid) across all payers where both exist; fallback to average Allowed."""
+            shares: List[float] = []
+            for p, a_map in self.allowed_amounts.items():
+                a = a_map.get(cpt)
+                b = self.paid_amounts.get(p, {}).get(cpt) if hasattr(self, 'paid_amounts') else None
+                if a is not None and b is not None:
+                    shares.append(max(0.0, a - b))
+            if shares:
+                return sum(shares) / len(shares)
+            # last resort: average allowed amount
+            return self.get_average_allowed_amount(cpt)
+    
+        total_patient_share = 0.0
+    
+        for cpt in cpt_codes:
+            # If we have a mapped payer, try that first
+            if payer_code:
+                a = self.allowed_amounts.get(payer_code, {}).get(cpt)
+                b = self.paid_amounts.get(payer_code, {}).get(cpt) if hasattr(self, 'paid_amounts') else None
+    
+                if a is not None and b is not None:
+                    total_patient_share += max(0.0, a - b)
+                    continue
+                if a is not None and b is None:
+                    total_patient_share += a
+                    continue
+    
+            # Fallbacks when payer not mapped for this CPT, or values missing
+            total_patient_share += avg_patient_share_for_cpt(cpt)
+    
+        calculated_pr = round(total_patient_share, 2)
+        
+        # Check if we have a definite copay from PVerify
+        pverify_copay = 0.0
+        pverify_status = None
+        if pverify_data:
+            financial_data = pverify_data.get('financial_data', {})
+            pverify_copay = financial_data.get('copay', 0)
+            # Get eligibility status to determine if $0 copay is valid
+            eligibility_data = pverify_data.get('eligibility_data', {})
+            status_raw = eligibility_data.get('status') if eligibility_data else None
+            pverify_status = status_raw.strip().upper() if isinstance(status_raw, str) and status_raw else None
+        
+        # Determine if we should use PVerify copay
+        # Use PVerify copay if: (1) copay > 0, OR (2) status is Active and copay is 0 (meaning $0 is valid)
+        use_pverify_copay = pverify_copay > 0 or (pverify_status == 'ACTIVE' and pverify_copay == 0)
+        
+        # Apply service line logic
+        if service_line == 'IM ketamine':
+            # For IM: use PVerify copay if valid, otherwise use table calculation
+            if use_pverify_copay:
+                calculated_pr = float(pverify_copay)
+                logger.debug(f"IM ketamine PR using PVerify copay: ${calculated_pr:.2f} (status: {pverify_status})")
+            else:
+                # Use table calculation (already in calculated_pr)
+                logger.debug(f"IM ketamine PR using table calculation: ${calculated_pr:.2f}")
+        
+        elif service_line == 'Med Management (Psych E/M)':
+            # For MedMan: use PVerify copay if valid, otherwise use table calculation
+            if use_pverify_copay:
+                med_man_pr = float(pverify_copay)
+            else:
+                # Use table calculation
+                med_man_pr = calculated_pr
+            
+            # MedMan can never exceed IM PR - get IM PR first for comparison
+            im_pr = self.calculate_service_line_responsibility_enhanced(insurance, pverify_data, 'IM ketamine')
+            
+            # Cap MedMan at IM PR if IM PR is available and non-zero
+            if im_pr > 0 and med_man_pr > im_pr:
+                calculated_pr = im_pr
+                logger.debug(f"Med Management PR capped at IM PR: ${calculated_pr:.2f} (would be ${med_man_pr:.2f}, IM PR: ${im_pr:.2f})")
+            else:
+                calculated_pr = med_man_pr
+                if use_pverify_copay:
+                    logger.debug(f"Med Management PR using PVerify copay: ${calculated_pr:.2f} (status: {pverify_status})")
+                else:
+                    logger.debug(f"Med Management PR using table calculation: ${calculated_pr:.2f}")
+        
+        return calculated_pr
+
+
+    
     def calculate_service_line_responsibility(self, insurance: Dict, pverify_data: Dict, service_line: str) -> str:
         """Calculate patient responsibility for a specific service line."""
+        # Use enhanced calculation to get dollar amount
+        enhanced_amount = self.calculate_service_line_responsibility_enhanced(insurance, pverify_data, service_line)
+        
+        # Check if PVerify status is Active (to determine if $0 is valid)
+        pverify_status = None
+        if pverify_data:
+            eligibility_data = pverify_data.get('eligibility_data', {})
+            status_raw = eligibility_data.get('status') if eligibility_data else None
+            pverify_status = status_raw.strip().upper() if isinstance(status_raw, str) and status_raw else None
+        
         payer_type = self.get_payer_type(insurance)
-        pverify_financial = pverify_data.get('financial_data', {})
         
-        # Get copay and coinsurance data (PVerify priority, AMD fallback)
-        copay_amount = pverify_financial.get('copay', 0) or insurance.get('copaydollaramount', 0)
-        coinsurance_pct = pverify_financial.get('coinsurance', 0) or insurance.get('copaypercentageamount', 0)
-        
-        # Apply rules based on payer type and service line
+        # Handle special Medicaid cases that return text instead of dollar amounts
         if payer_type == 'Medicaid':
-            if service_line == 'IM ketamine':
-                return '$0 patient responsibility'
-            elif service_line == 'KAP':
-                return '$0 patient responsibility'
+            if service_line == 'Med Management (Psych E/M)':
+                if enhanced_amount == 0.0:
+                    return 'Typically $0 if eligible (Medicaid balances should be $0). Verify under the medical service type (drill to 01 = Medical Care) when checking E/M.'
+                else:
+                    return f'${enhanced_amount:.2f} patient responsibility'
             elif service_line == 'Spravato':
-                return 'Copay/coinsurance/deductible per eligibility'
-            elif service_line == 'Med Management (Psych E/M)':
-                return 'Typically $0 if eligible (Medicaid balances should be $0). Verify under the medical service type (drill to 01 = Medical Care) when checking E/M.'
+                if enhanced_amount == 0.0:
+                    return 'Copay/coinsurance/deductible per eligibility'
+                else:
+                    return f'${enhanced_amount:.2f} patient responsibility'
         
-        elif payer_type == 'Commercial' or payer_type == 'Medicare Advantage':
-            # For commercial payers, return copay/coinsurance/deductible info
-            if copay_amount > 0:
-                return f'${copay_amount:.2f} copay'
-            elif coinsurance_pct > 0:
-                return f'{coinsurance_pct:.0f}% coinsurance'
-            else:
-                return 'Copay/coinsurance/deductible per eligibility'
-        
+        # Handle Self-Pay special text cases
         elif payer_type == 'Self-Pay':
             if service_line == 'IM ketamine':
                 return '$399 at first visit ("Self-Pay Item: Ketamine Induction")'
             elif service_line == 'KAP':
-                return 'No explicit amount documented in KB'
+                if enhanced_amount == 0.0:
+                    return 'No explicit amount documented in KB'
+                else:
+                    return f'${enhanced_amount:.2f} patient responsibility'
             elif service_line == 'Spravato':
                 return '$949 self-pay Spravato induction'
             elif service_line == 'Med Management (Psych E/M)':
-                return 'No self-pay policy'
+                if enhanced_amount == 0.0:
+                    return 'No self-pay policy'
+                else:
+                    return f'${enhanced_amount:.2f} patient responsibility'
         
-        # Default fallback
-        return 'Copay/coinsurance/deductible per eligibility'
+        override = self._evaluate_coinsurance_override(insurance, pverify_data, service_line)
+        if override['applies']:
+            if override['force_per_elig']:
+                return 'Copay/coinsurance/deductible per eligibility'
+            return f'${enhanced_amount:.2f} patient responsibility'
+
+        # For all other cases, return calculated dollar amount or fallback text
+        # If status is Active and amount is 0, return $0.00 (valid $0 copay from PVerify)
+        if pverify_status == 'ACTIVE' and enhanced_amount == 0.0:
+            return '$0.00 patient responsibility'
+        elif enhanced_amount > 0:
+            return f'${enhanced_amount:.2f} patient responsibility'
+        else:
+            return 'Copay/coinsurance/deductible per eligibility'
     
-    def has_dollar_values(self, insurance: Dict, pverify_data: Dict) -> bool:
-        """Check if any service line has specific dollar values (including $0)."""
+    def should_post_memo(self, insurance: Dict, pverify_data: Dict) -> bool:
+        """
+        Determine if memo should be posted based on filtering rules:
+        - Do NOT post if memo has no dollar amounts and only "Per Elig" everywhere
+        - Do NOT post if memo has a mix of "Per Elig" and $0 amounts (from table fallback)
+        - DO post if memo has AT LEAST one non-zero dollar amount, OR no "Per Elig" at all
+        - DO post if memo has $0.00 from PVerify with Active status (valid definite amounts)
+        """
         service_lines = ['IM ketamine', 'KAP', 'Spravato', 'Med Management (Psych E/M)']
         
-        for service_line in service_lines:
-            responsibility = self.calculate_service_line_responsibility(insurance, pverify_data, service_line)
-            
-            # Check if the responsibility contains dollar amounts (including $0) or percentages
-            if '$' in responsibility:
-                return True
-            if '%' in responsibility:
-                return True
+        has_per_elig = False
+        has_non_zero_dollar = False
+        has_zero_dollar = False
+        has_valid_zero = False  # $0.00 from PVerify with Active status
+        has_other_values = False
+
+        # Check if PVerify status is Active (to validate $0 copays)
+        pverify_status = None
+        if pverify_data:
+            eligibility_data = pverify_data.get('eligibility_data', {})
+            status_raw = eligibility_data.get('status') if eligibility_data else None
+            pverify_status = status_raw.strip().upper() if isinstance(status_raw, str) and status_raw else None
+        is_active = pverify_status == 'ACTIVE'
+
+        name_upper = (insurance.get('carname') or '').upper()
+
+        # 🚫 Skip Medicaid, Medicare & RAEs — no PR to post
+        if any(tag in name_upper for tag in [
+            'MEDICAID',
+            'HEALTH FIRST MEDICAID',
+            'MEDICARE',
+            'CO ACCESS',
+            'COLORADO ACCESS',
+            'CCHA',
+            'COLORADO COMMUNITY HEALTH ALLIANCE'
+        ]):
+            logger.debug(f"Skipping memo: Medicaid/Medicare/RAE plan [{name_upper}] — no PR to post")
+            return False
         
+        for service_line in service_lines:
+            # Get the formatted responsibility text (what appears in memo)
+            responsibility = self.calculate_service_line_responsibility(insurance, pverify_data, service_line)
+            resp_abbrev = self.get_responsibility_abbreviation(responsibility)
+            
+            # Check what type of value this is
+            if resp_abbrev == 'Per Elig':
+                has_per_elig = True
+            elif resp_abbrev == '$0' or resp_abbrev == '$0.00':
+                # Check if this $0 is from PVerify with Active status (valid definite amount)
+                if is_active and responsibility == '$0.00 patient responsibility':
+                    has_valid_zero = True
+                else:
+                    has_zero_dollar = True
+            elif resp_abbrev.startswith('$') and resp_abbrev not in ['$0', '$0.00']:
+                # Extract dollar amount to check if non-zero
+                import re
+                dollar_match = re.search(r'\$(\d+(?:\.\d{2})?)', resp_abbrev)
+                if dollar_match:
+                    amount = float(dollar_match.group(1))
+                    if amount > 0:
+                        has_non_zero_dollar = True
+                    else:
+                        has_zero_dollar = True
+            elif resp_abbrev.endswith('%') or resp_abbrev in ['No Policy', 'TBD']:
+                has_other_values = True
+        
+        # Apply filtering rules:
+        
+        # Rule 1: Do NOT post if only "Per Elig" everywhere
+        if has_per_elig and not has_non_zero_dollar and not has_zero_dollar and not has_other_values and not has_valid_zero:
+            logger.debug(f"Filtering out memo: only 'Per Elig' values found")
+            return False
+        
+        # Rule 2: Do NOT post if mix of "Per Elig" and $0 amounts (no positive amounts or other values)
+        # UNLESS the $0 amounts are valid from PVerify Active status
+        if has_per_elig and has_zero_dollar and not has_non_zero_dollar and not has_other_values and not has_valid_zero:
+            logger.debug(f"Filtering out memo: mix of 'Per Elig' and $0 amounts only")
+            return False
+        
+        # Rule 3: DO post if AT LEAST one non-zero dollar amount
+        if has_non_zero_dollar:
+            logger.debug(f"Posting memo: has non-zero dollar amount")
+            return True
+        
+        # Rule 3b: DO post if we have valid $0.00 from PVerify (definite amounts)
+        if has_valid_zero:
+            logger.debug(f"Posting memo: has valid $0.00 from PVerify with Active status")
+            return True
+        
+        # Rule 4: DO post if no "Per Elig" at all (even if all $0 or other values)
+        if not has_per_elig:
+            logger.debug(f"Posting memo: no 'Per Elig' values found")
+            return True
+        
+        # Default: do not post
+        logger.debug(f"Filtering out memo: does not meet posting criteria")
         return False
     
     def get_payer_abbreviation(self, payer_name: str) -> str:
@@ -1129,23 +2062,46 @@ class PatientResponsibilityAgent:
             logger.warning("No patients found")
             return
         
-        # Step 3: Filter patients WITHOUT appointments
-        logger.info("Filtering patients without appointments...")
-        patients_without_appointments = []
+        # Step 3: Filter patients by appointment criteria
+        # Include patients with NO appointments OR patients with appointments TOMORROW (Denver time)
+        logger.info("Filtering patients by appointment criteria (no appointments or appointments tomorrow)...")
+        patients_to_process = []
         
         for patient in patients:
-            if not self.amd_api.has_appointments(patient['id']):
-                patients_without_appointments.append(patient)
+            if self.amd_api.should_process_patient_by_appointments(patient['id']):
+                patients_to_process.append(patient)
         
-        logger.info(f"Found {len(patients_without_appointments)} patients without appointments")
-        self.final_patients = patients_without_appointments
+        logger.info(f"Found {len(patients_to_process)} patients matching appointment criteria")
+        self.final_patients = patients_to_process
         
         # Step 4: Process each patient
         for patient in self.final_patients:
             logger.info(f"Processing patient: {patient['name']} (ID: {patient['id']})")
             
             try:
-                # Step 4a: Run PVerify eligibility check for each active insurance
+                # Step 4a: Check if ANY active insurance is Medicaid/Medicare/RAE - skip patient entirely if so
+                has_medicaid_medicare = False
+                for insurance_check in patient['insurances']:
+                    if insurance_check['active']:
+                        name_upper = (insurance_check.get('carname') or '').upper()
+                        if any(tag in name_upper for tag in [
+                            'MEDICAID',
+                            'HEALTH FIRST MEDICAID',
+                            'MEDICARE',
+                            'CO ACCESS',
+                            'COLORADO ACCESS',
+                            'CCHA',
+                            'COLORADO COMMUNITY HEALTH ALLIANCE'
+                        ]):
+                            has_medicaid_medicare = True
+                            logger.info(f"Skipping patient {patient['name']} entirely - has Medicaid/Medicare/RAE insurance: {insurance_check.get('carname')}")
+                            break
+                
+                if has_medicaid_medicare:
+                    # Skip this patient entirely - don't run PVerify or post any memos
+                    continue
+                
+                # Step 4b: Run PVerify eligibility check for each active insurance
                 pverify_results = {}
                 for insurance in patient['insurances']:
                     if insurance['active']:
@@ -1165,19 +2121,34 @@ class PatientResponsibilityAgent:
                         else:
                             logger.warning(f"No PVerify data for {patient['name']} - {insurance.get('carname')}")
                 
-                # Step 4b: Generate and post comprehensive memo for each active insurance
+                # Step 4c: Generate and post comprehensive memo for each active insurance
                 for insurance in patient['insurances']:
                     if insurance['active']:
                         # Get PVerify data for this insurance
                         pverify_data = pverify_results.get(insurance['id'], {})
                         
-                        # Check if memo has any specific dollar values or percentages
-                        if not self.has_dollar_values(insurance, pverify_data):
-                            logger.info(f"Skipping memo for {patient['name']} - {insurance.get('carname')} (no specific dollar values)")
-                            continue
+                        memo_text = ""
                         
                         # Generate comprehensive memo with all service lines
                         memo_text = self.generate_comprehensive_memo(patient, insurance, pverify_data)
+
+                        # 🚫 De-dupe: if we already logged this exact memo for this patient, skip everything
+                        if memo_already_logged(patient['name'], insurance.get('carname',''), memo_text):
+                            logger.info(f"Duplicate memo detected — skipping post & DB log for {patient['name']} - {insurance.get('carname')}")
+                            continue
+                        
+                        # Check if memo should be posted based on filtering rules
+                        if not self.should_post_memo(insurance, pverify_data):
+                            logger.info(f"Skipping memo for {patient['name']} - {insurance.get('carname')} (filtered out per posting rules)")
+                            skip_time = utc_now()
+                            log_agent_run_skipped(
+                                reason=f"Skipped due to posting rules. Patient: {patient['name']} | Insurance: {insurance.get('carname')} | Memo preview: {memo_text}",
+                                started_at_utc=skip_time,
+                                ended_at_utc=skip_time,
+                                documents_processed=0
+                            )
+                            continue
+                        
                         
                         # Post memo to AMD
                         success = self.amd_api.post_memo(patient['id'], memo_text)
