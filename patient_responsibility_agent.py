@@ -764,18 +764,14 @@ def _pg_conn():
     finally:
         conn.close()
 
-def log_agent_run_success(selected_plan_name: str, started_at_utc: datetime, ended_at_utc: datetime, documents_processed: int = 1):
+def log_agent_run_success(patient_memo: str, started_at_utc: datetime, ended_at_utc: datetime, documents_processed: int = 1):
     """
     Inserts a success row into agent_run_logs with explicit casts to match DB types.
     """
-    if not selected_plan_name:
-        selected_plan_name = ""
+    if not patient_memo:
+        patient_memo = ""
 
-    output_payload = {
-        "message": "Patient responsibility processing completed successfully",
-        "selected_plan": selected_plan_name,
-        "documents_processed": documents_processed
-    }
+    output_payload = psycopg2.extras.Json({"message": patient_memo})
 
     sql = """
         INSERT INTO agent_run_logs 
@@ -789,7 +785,7 @@ def log_agent_run_success(selected_plan_name: str, started_at_utc: datetime, end
         str(uuid.UUID(config.AGENT_ID)) if config.AGENT_ID else str(uuid.uuid4()),  # ensure UUID type
         int(documents_processed),                 # int
         "success",                                # text
-        psycopg2.extras.Json(output_payload),     # json -> jsonb
+        output_payload,                           # jsonb (already wrapped in Json)
         started_at_utc,                           # timestamptz
         ended_at_utc,                             # timestamptz
         False,                                    # bool
