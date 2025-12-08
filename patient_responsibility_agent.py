@@ -1272,7 +1272,8 @@ class PatientResponsibilityAgent:
             'KAP': ['90791', '90837', '96130'],
             'Spravato': ['G2083'],
             'Med Management (Psych E/M)': ['99204', '99205', '99215', '99417'],
-            'IM ketamine': ['96372', '96372-59', 'J3490', 'J3490-GA']
+            'IM ketamine': ['96372', '96372-59', 'J3490', 'J3490-GA'],
+            'Integration': ['99214', '90837']
         }
     
     def _init_payer_mappings(self):
@@ -1281,15 +1282,37 @@ class PatientResponsibilityAgent:
             # Health First Medicaid
             'HFM': ['HEALTH FIRST MEDICAID', 'HFM', 'MEDICAID'],
             # Texas Blue Shield  
-            'TBS': ['TEXAS BLUE SHIELD', 'TBS', 'BLUE CROSS BLUE SHIELD OF TEXAS', 'BCBS TEXAS'],
+            'TBS': ['TEXAS BLUE SHIELD', 'TBS', 'BLUE CROSS BLUE SHIELD OF TEXAS', 'BCBS TEXAS', 'BCBS TX PPO', 'BCBS TX: HMO BLUE TEXAS'],
             # Anthem BCBS
             'ANT': ['ANTHEM', 'ANTHEM BLUE CROSS', 'ANTHEM BCBS', 'ANTHEM BLUE CROSS BLUE SHIELD'],
             # Colorado Access
             'COA': ['COLORADO ACCESS', 'COA'],
             # United Healthcare
-            'UHC': ['UNITED HEALTHCARE', 'UHC', 'UNITED', 'UNITEDHEALTHCARE'],
+            'UHC': ['UNITED HEALTHCARE', 'UHC', 'UNITED', 'UNITEDHEALTHCARE', 'UNITED HEALTHCARE CHOICE PLUS'],
             # Medicare
-            'MCR': ['MEDICARE', 'MCR', 'MEDICARE ADVANTAGE']
+            'MCR': ['MEDICARE', 'MCR', 'MEDICARE ADVANTAGE', 'COLORADO MEDICARE', 'CIGNA MEDICARE HMO'],
+            # Cigna
+            'CIG': ['CIGNA', 'CIGNA LOCALPLUS', 'BRAVO CIGNA'],
+            # Aetna
+            'AET': ['AETNA', 'AETNA OPEN CHOICE / NAP'],
+            # AARP
+            'AARP': ['AARP'],
+            # Meritain Health
+            'MER': ['MERITAIN HEALTH'],
+            # Humana
+            'HUM': ['HUMANA'],
+            # UMR
+            'UMR': ['UMR'],
+            # Select Health Value Network
+            'SHV': ['SELECT HEALTH VALUE NETWORK'],
+            # Colorado Community Health Alliance
+            'CCHA': ['COLORADO COMMUNITY HEALTH ALLIANCE'],
+            # Colorado Medicaid / Medicaid Texas
+            'COL': ['COLORADO MEDICAID', 'MEDICAID TEXAS'],
+            # BCBS IL
+            'BCBS': ['BCBS IL'],
+            # Tricare
+            'TRI': ['TRICARE EAST', 'TRICARE FOR LIFE']
         }
     
     def _init_allowed_amounts(self):
@@ -1335,8 +1358,69 @@ class PatientResponsibilityAgent:
                 '96130-59': 109.55
             },
             'MCR': {
-                '99215': 179.34, '90837': 156.60, '99214': 127.92, 'J3490': 0.20,
-                'G2212': 31.52, '96130': 118.96, '90791': 169.43, '96372': 14.33
+                '90791': 138.17, '90837': 101.87, '90834': 101.57, '96372': 24.35,
+                'J3490': 0.65, '99215': 0, '99214': 0, '99213': 108.73, '99204': 0,
+                'G2082': 0, 'S0013': 0
+            },
+            'CIG': {
+                '90791': 159.08, '90837': 168.9, '90834': 101.57, '90853': 135.2, '96372': 60,
+                'J3490': 1, '99215': 176.3, '99214': 176.3, '99213': 134.14, '99204': 202.29,
+                'G2083': 1246.12, 'G2082': 852.48, '99417': 166.39, 'G2212': 213.4, '99441': 106.67
+            },
+            'AET': {
+                '90791': 0, '90837': 157.61, '90834': 101.57, '90853': 135.2, '96372': 26.64,
+                'J3490': 1.25, '99215': 162.83, '99214': 158, '99213': 116.35, '99204': 199.36,
+                '99203': 164.71, '99205': 106.67, 'G2083': 1246.12, 'G2082': 853.13, 'G2212': 1312.65,
+                '99417': 170.335, '99441': 106.67, 'S0013': 1231.44
+            },
+            'AARP': {
+                '90791': 159.43, '90837': 110.3, '90834': 89.25, '90853': 63.07, '96372': 0,
+                'J3490': 0, '99215': 0, '99214': 0, '99213': 108.73, '99204': 0,
+                'G2083': 0, 'G2082': 0
+            },
+            'MER': {
+                '90791': 0, '90837': 157.61, '90834': 101.57, '90853': 135.2, '96372': 26.64,
+                'J3490': 1.25, '99215': 149.95, '99214': 158, '99213': 116.35, '99204': 155.12,
+                '99205': 106.67, 'G2083': 1246.12, 'G2082': 853.13, 'G2212': 107.1, '99417': 166.39,
+                '99441': 106.67, 'S0013': 1231.44
+            },
+            'HUM': {
+                '90791': 0, '90837': 83.37, '90834': 79.98, '90853': 107.04, '96372': 22.04,
+                'J3490': 0.65, '99215': 76.24, '99214': 145.28, '99213': 92.01, '99204': 129.38,
+                '99203': 0, 'G2083': 1246.12, 'G2082': 853.13, 'G2212': 107.1, '99441': 106.67
+            },
+            'UMR': {
+                '90791': 0, '90837': 110.3, '90834': 79.98, '90853': 107.04, '96372': 32,
+                'J3490': 0.66, '99215': 129.81, '99214': 164.4, '99213': 122.4, '99204': 0,
+                'G2083': 1246.12, 'G2082': 853.13, 'G2212': 155.2, '99441': 106.67
+            },
+            'SHV': {
+                '90791': 0, '90837': 110.3, '90834': 89.25, '90853': 63.07, '96372': 22.04,
+                'J3490': 0.7, '99215': 132.5, '99214': 145.28, '99213': 92.01, '99204': 179.31,
+                '99203': 0, 'G2083': 1246.12, 'G2082': 852.805, 'G2212': 107.1, '99417': 174.28,
+                '99441': 106.67, 'S0013': 1231.44
+            },
+            'CCHA': {
+                '90791': 121.58, '90837': 103.22, '90834': 69.36, '90853': 19.1, '96372': 24.35,
+                'J3490': 0.6, '99215': 0, '99214': 0, '99213': 106.67, '99204': 0,
+                'G2083': 0, 'G2082': 0, 'S0013': 0, '99441': 106.67
+            },
+            'COL': {
+                '90791': 0, '90792': 106.67, '90837': 0, '90834': 89.25, '90853': 0, '96372': 29.78,
+                'J3490': 0.6, '99215': 149.95, '99214': 0, '99213': 75.5, '99204': 179.31,
+                '99203': 182.93, 'G2083': 1246.12, 'G2082': 852.48, 'G2212': 21.43, '99417': 174.28,
+                'T1014': 106.67, 'S0013': 0
+            },
+            'BCBS': {
+                '90791': 0, '90837': 118.66, '90834': 89.25, '90853': 63.07, '96372': 27,
+                'J3490': 0.01, '99215': 129.81, '99214': 170.88, '99213': 89.37, '99204': 179.31,
+                '99203': 0, 'G2083': 1246.12, 'G2082': 852.805, 'G2212': 131.15, '99417': 170.335,
+                '99441': 106.67, 'S0013': 1231.44
+            },
+            'TRI': {
+                '90791': 0, '90837': 110.3, '90834': 74.12, '90853': 63.07, '96372': 0,
+                'J3490': 0, '99215': 0, '99214': 0, '99213': 108.73, '99204': 155.12,
+                '99203': 0, 'G2083': 0, 'G2082': 0, '99441': 106.67
             }
         }
 
@@ -1904,7 +1988,7 @@ class PatientResponsibilityAgent:
         - DO post if memo has AT LEAST one non-zero dollar amount, OR no "Per Elig" at all
         - DO post if memo has $0.00 from PVerify with Active status (valid definite amounts)
         """
-        service_lines = ['IM ketamine', 'KAP', 'Spravato', 'Med Management (Psych E/M)']
+        service_lines = ['IM ketamine', 'KAP', 'Spravato', 'Med Management (Psych E/M)', 'Integration']
         
         has_per_elig = False
         has_non_zero_dollar = False
@@ -2031,7 +2115,8 @@ class PatientResponsibilityAgent:
             'IM ketamine': 'IM',
             'KAP': 'KAP',
             'Spravato': 'SPR',
-            'Med Management (Psych E/M)': 'MM'
+            'Med Management (Psych E/M)': 'MM',
+            'Integration': 'INTGRTN'
         }
         return abbreviations.get(service_line, service_line[:3])
     
@@ -2070,7 +2155,7 @@ class PatientResponsibilityAgent:
         payer_abbrev = self.get_payer_abbreviation(payer_name)
         
         # Service lines to include
-        service_lines = ['IM ketamine', 'KAP', 'Spravato', 'Med Management (Psych E/M)']
+        service_lines = ['IM ketamine', 'KAP', 'Spravato', 'Med Management (Psych E/M)', 'Integration']
         
         # Create compact memo lines
         memo_lines = [f"{payer_abbrev} PR:"]
