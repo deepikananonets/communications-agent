@@ -38,14 +38,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def memo_already_logged(patient_name: str, insurance_name: str, memo_text: str, lookback_days: int = 90) -> bool:
+def memo_already_logged(patient_name: str, insurance_name: str, memo_text: str, lookback_days: Optional[int] = None) -> bool:
     """
     Returns True if an identical memo was already logged for this patient (success or skipped)
     within the lookback window. We match on the exact memo text + patient name.
+    By default, uses memo_expiration_days from config to only block duplicates if the previous memo hasn't expired yet.
     """
     # Patterns that match how we currently log messages
     success_msg = f"Patient: {patient_name} | Memo: {memo_text}"
     skipped_msg = f"Skipped due to posting rules. Patient: {patient_name} | Insurance: {insurance_name} | Memo preview: {memo_text}"
+    
+    if lookback_days is None:
+        lookback_days = config.PROCESSING_CONFIG['memo_expiration_days']
 
     sql = """
         SELECT 1
@@ -543,11 +547,12 @@ class AdvancedMDAPI:
         """Post a memo to patient record."""
         if not self.token:
             return False
-            
+
         created_datetime = datetime.now()
         msgtime_str = created_datetime.strftime("%m/%d/%Y %I:%M:%S %p")
         created_date_str = created_datetime.strftime("%m/%d/%Y")
-        expire_date_str = (created_datetime + timedelta(days=3)).strftime("%m/%d/%Y")
+        memo_expiration_days = config.PROCESSING_CONFIG['memo_expiration_days']
+        expire_date_str = (created_datetime + timedelta(days=memo_expiration_days)).strftime("%m/%d/%Y")
 
         payload = {
             "ppmdmsg": {

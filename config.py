@@ -24,7 +24,8 @@ ZAPIER_WEBHOOK_URL = os.getenv('ZAPIER_WEBHOOK_URL')
 PROCESSING_CONFIG = {
     'hours_back': 24,  # How many hours back to look for updated patients
     'eligibility_wait_time': 2,  # Seconds to wait between eligibility calls
-    'coinsurance_multiplier': 400  # Amount to multiply coinsurance percentage by
+    'coinsurance_multiplier': 400,  # Amount to multiply coinsurance percentage by
+    'memo_expiration_days': 3  # Number of days after which memos expire
 }
 
 # Default coinsurance rate (as a decimal) applied when eligibility data is unavailable
