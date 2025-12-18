@@ -2,11 +2,15 @@
 Configuration file for Patient Responsibility Memo Agent
 """
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # AdvancedMD API Configuration
 AMD_CONFIG = {
     'base_url': 'https://providerapi.advancedmd.com/processrequest/api-128/NANONETS-HEALTH/xmlrpc/processrequest.aspx',
-    'api_base_url': 'https://providerapi.advancedmd.com/api/api-801/TEMP',
+    'api_base_url': 'https://providerapi.advancedmd.com/api/api-128/NANONETS-HEALTH',
     'username': os.getenv('AMD_USERNAME'),
     'password': os.getenv('AMD_PASSWORD'),
     'office_code': int(os.getenv('AMD_OFFICE_CODE', 0)),
@@ -55,15 +59,6 @@ DB_CONFIG = {
     'username': os.getenv('FLEMING_DB_USER'),
     'password': os.getenv('FLEMING_DB_PASSWORD'),
     'sslmode': os.getenv('FLEMING_DB_SSLMODE', 'require')
-}
-
-# SSH Configuration for database connection
-SSH_CONFIG = {
-    'use_ssh': os.getenv('USE_SSH', '1').strip().lower() in ("1","true","yes","on"),
-    'bastion_host': os.getenv('FLEMING_SSH_HOST', ''),
-    'bastion_port': int(os.getenv('FLEMING_SSH_PORT', '22')),
-    'bastion_user': os.getenv('FLEMING_SSH_USER', ''),
-    'private_key_path': os.getenv('SSH_PRIVATE_KEY_PATH', '/home/runner/.ssh/id_rsa')
 }
 
 # Agent ID for database logging

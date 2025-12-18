@@ -19,12 +19,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 import time
 import logging
-import os
 import uuid
 import contextlib
 import psycopg2
 import psycopg2.extras
-from sshtunnel import SSHTunnelForwarder
 from zoneinfo import ZoneInfo
 import config
 
@@ -72,7 +70,7 @@ def memo_already_logged(patient_name: str, insurance_name: str, memo_text: str, 
         skipped_msg,
     )
     try:
-        with _pg_conn_via_ssh() as conn:
+        with _pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, args)
                 return cur.fetchone() is not None
@@ -97,6 +95,11 @@ class AdvancedMDAPI:
         
     def authenticate(self) -> bool:
         """Authenticate with AdvancedMD and get session token."""
+        # Check if credentials are configured
+        if not self.username or not self.password:
+            logger.error("AdvancedMD credentials not configured. Please set AMD_USERNAME and AMD_PASSWORD environment variables.")
+            return False
+        
         payload = {
             "ppmdmsg": {
                 "@action": "login",
@@ -117,6 +120,10 @@ class AdvancedMDAPI:
             )
             response.raise_for_status()
             
+            # Log response for debugging (first 500 chars to avoid logging sensitive data)
+            logger.debug(f"Authentication response status: {response.status_code}")
+            logger.debug(f"Authentication response (first 500 chars): {response.text[:500]}")
+            
             # Parse XML response to extract token
             root = ET.fromstring(response.text)
             usercontext = root.find('.//usercontext')
@@ -125,11 +132,23 @@ class AdvancedMDAPI:
                 logger.info("Successfully authenticated with AdvancedMD")
                 return True
             else:
-                logger.error("Failed to extract token from response")
+                # Check for error messages in the response
+                error_elem = root.find('.//error')
+                if error_elem is not None:
+                    error_msg = error_elem.text if error_elem.text else "Unknown error"
+                    logger.error(f"Authentication error from AdvancedMD: {error_msg}")
+                else:
+                    logger.error(f"Failed to extract token from response. Response structure: {ET.tostring(root, encoding='unicode')[:500]}")
                 return False
                 
+        except ET.ParseError as e:
+            logger.error(f"Failed to parse XML response: {e}")
+            logger.error(f"Response text: {response.text[:500] if 'response' in locals() else 'No response'}")
+            return False
         except Exception as e:
             logger.error(f"Authentication failed: {e}")
+            if 'response' in locals():
+                logger.error(f"Response status: {response.status_code}, Response text: {response.text[:500]}")
             return False
     
     def get_updated_patients(self, hours_back: int = 24) -> List[Dict]:
@@ -317,6 +336,11 @@ class AdvancedMDAPI:
                 has_appts = visit_count > 0
                 logger.debug(f"Patient {patient_id} has {visit_count} visits/appointments: {has_appts}")
                 return has_appts
+            elif response.status_code == 403:
+                # 403 Forbidden - API endpoint may not be accessible with current permissions
+                # Assume no appointments to allow processing to continue
+                logger.debug(f"Appointments endpoint not accessible for patient {patient_id} (403), assuming no appointments")
+                return False
             else:
                 logger.warning(f"No results found in response for patient {patient_id}")
                 return False
@@ -1042,101 +1066,32 @@ class PVerifyAPI:
             return financial_data
 
 
-class ZapierWebhook:
-    """Zapier webhook integration."""
-    
-    def __init__(self, webhook_url: str):
-        self.webhook_url = webhook_url
-    
-    def send_patient_data(self, patient_name: str) -> Optional[str]:
-        """Send patient data to Zapier webhook and get service line response."""
-        payload = {"patient_name": patient_name}
-        
-        try:
-            # Send the request to the webhook URL
-            logger.info(f"Sending webhook request for {patient_name} to {self.webhook_url}")
-            logger.debug(f"Payload: {payload}")
-            
-            response = requests.post(self.webhook_url, json=payload, timeout=30)
-            response.raise_for_status()
-            logger.info(f"Webhook response status: {response.status_code}")
-            
-            # Parse the actual response from Zapier
-            result = response.json()
-            logger.info(f"Zapier response for {patient_name}: {result}")
-            
-            service_line = result.get("Service Type")
-            
-            if not service_line or service_line.strip() == "":
-                logger.warning(f"No service type returned for {patient_name} - skipping patient")
-                return None
-            
-            logger.info(f"Received service line for {patient_name}: {service_line}")
-            return service_line.strip()
-            
-        except Exception as e:
-            logger.warning(f"Webhook request failed for {patient_name}: {e}")
-            logger.info(f"Skipping patient due to webhook failure")
-            # If webhook fails, return None to skip patient
-            return None
-
-
 def utc_now():
     # Return timezone-aware UTC for Postgres timestamptz
     return datetime.now(timezone.utc)
 
 @contextlib.contextmanager
-def _pg_conn_via_ssh():
+def _pg_conn():
     """
-    Yields a psycopg2 connection to RDS through an SSH tunnel (or direct if USE_SSH=0).
+    Yields a psycopg2 connection to the database.
     SSL is enforced (sslmode=require).
     """
-    if not config.SSH_CONFIG['use_ssh']:
-        conn = psycopg2.connect(
-            host=config.DB_CONFIG['host'],
-            port=config.DB_CONFIG['port'],
-            dbname=config.DB_CONFIG['database'],
-            user=config.DB_CONFIG['username'],
-            password=config.DB_CONFIG['password'],
-            sslmode=config.DB_CONFIG['sslmode'],
-        )
-        try:
-            yield conn
-        finally:
-            conn.close()
-        return
-
-    # Check if SSH key file exists and is readable
-    ssh_key_path = config.SSH_CONFIG['private_key_path']
-    if not os.path.isfile(ssh_key_path):
-        raise FileNotFoundError(f"SSH private key file not found: {ssh_key_path}")
+    # Check if database is configured
+    if not config.DB_CONFIG['host']:
+        raise ValueError("Database not configured: FLEMING_DB_HOST environment variable is not set")
     
-    # Log SSH connection details (without sensitive info)
-    logger.info(f"Establishing SSH tunnel to {config.SSH_CONFIG['bastion_host']}:{config.SSH_CONFIG['bastion_port']} as {config.SSH_CONFIG['bastion_user']}")
-    
-    server = SSHTunnelForwarder(
-        (config.SSH_CONFIG['bastion_host'], config.SSH_CONFIG['bastion_port']),
-        ssh_username=config.SSH_CONFIG['bastion_user'],
-        ssh_pkey=ssh_key_path,
-        remote_bind_address=(config.DB_CONFIG['host'], config.DB_CONFIG['port']),
-        set_keepalive=60.0,
+    conn = psycopg2.connect(
+        host=config.DB_CONFIG['host'],
+        port=config.DB_CONFIG['port'],
+        dbname=config.DB_CONFIG['database'],
+        user=config.DB_CONFIG['username'],
+        password=config.DB_CONFIG['password'],
+        sslmode=config.DB_CONFIG['sslmode'],
     )
-    server.start()
     try:
-        conn = psycopg2.connect(
-            host="127.0.0.1",
-            port=server.local_bind_port,
-            dbname=config.DB_CONFIG['database'],
-            user=config.DB_CONFIG['username'],
-            password=config.DB_CONFIG['password'],
-            sslmode=config.DB_CONFIG['sslmode'],
-        )
-        try:
-            yield conn
-        finally:
-            conn.close()
+        yield conn
     finally:
-        server.stop()
+        conn.close()
 
 
 def _is_financial_data_empty(fin: Dict) -> bool:
@@ -1174,11 +1129,14 @@ def log_agent_run_success(patient_memo: str, started_at_utc: datetime, ended_at_
     )
 
     try:
-        with _pg_conn_via_ssh() as conn:
+        with _pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, args)
             conn.commit()
         logger.info("agent_run_logs: success row inserted")
+    except ValueError as e:
+        # Database not configured - log warning but don't fail
+        logger.warning(f"Database logging skipped: {e}")
     except Exception as e:
         logger.error(f"Failed to write agent_run_logs: {e}", exc_info=True)
 
@@ -1208,7 +1166,7 @@ def log_agent_run_skipped(reason: str, started_at_utc: datetime, ended_at_utc: d
     )
 
     try:
-        with _pg_conn_via_ssh() as conn:
+        with _pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, args)
             conn.commit()
@@ -1243,21 +1201,23 @@ def log_agent_run_error(error_message: str, started_at_utc: datetime, ended_at_u
     )
 
     try:
-        with _pg_conn_via_ssh() as conn:
+        with _pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, args)
             conn.commit()
         logger.info("agent_run_logs: error row inserted")
+    except ValueError as e:
+        # Database not configured - log warning but don't fail
+        logger.warning(f"Database logging skipped: {e}")
     except Exception as e:
         logger.error(f"Failed to write agent_run_logs error: {e}", exc_info=True)
 
 class PatientResponsibilityAgent:
     """Main agent class that orchestrates the entire workflow."""
     
-    def __init__(self, zapier_webhook_url: str):
+    def __init__(self):
         self.amd_api = AdvancedMDAPI()
         self.pverify_api = PVerifyAPI()
-        self.zapier = ZapierWebhook(zapier_webhook_url)
         self.final_patients = []
         self.run_started = None
         self.documents_processed = 0
@@ -2340,7 +2300,7 @@ class PatientResponsibilityAgent:
 def main():
     """Main execution function."""
     # Initialize and run agent
-    agent = PatientResponsibilityAgent(config.ZAPIER_WEBHOOK_URL)
+    agent = PatientResponsibilityAgent()
     run_started = utc_now()
     
     try:
